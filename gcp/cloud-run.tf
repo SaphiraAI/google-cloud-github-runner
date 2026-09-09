@@ -38,6 +38,10 @@ module "cloud_run_github_runners_manager" {
         RECONCILE_STUCK_MINUTES = tostring(var.github_runners_reconcile_stuck_minutes)
         RECONCILE_REPOSITORIES  = join(",", var.github_runners_reconcile_repositories)
         RECONCILE_GIVE_UP_HOURS = tostring(var.github_runners_reconcile_give_up_hours)
+        # Webhook -> Cloud Tasks -> POST /tasks/provision (only this caller, with MANAGER_URL as audience)
+        PROVISION_QUEUE         = google_cloud_tasks_queue.github-runners-provision.id
+        PROVISION_INVOKER_EMAIL = module.service-account-github-runners-provisioner.email
+        MANAGER_URL             = local.github_runners_manager_audience
       }
       env_from_key = {
         GITHUB_APP_ID = {
@@ -88,6 +92,7 @@ module "cloud_run_github_runners_manager" {
   depends_on = [
     google_secret_manager_secret_version.secret-version-default,
     time_sleep.wait_for_service_account_cloud_run,
-    time_sleep.wait_for_service_account_reconciler
+    time_sleep.wait_for_service_account_reconciler,
+    time_sleep.wait_for_service_account_provisioner
   ]
 }

@@ -213,10 +213,18 @@ Instance creation waits for the Compute Engine operation and reports its result:
 (stockout, quota) fall back to the other zones of the region, in a stable order, before failing loudly.
 The zone a VM landed in is stored in the `gha-zone` label and deletion looks the VM up by name across zones.
 
-Trade-off: an insert operation takes about 10 seconds (more with zone fallback), longer than GitHub's
-10-second webhook delivery timeout. The VM is still created and the outcome is logged, but GitHub's
-delivery log may show the `queued` delivery as timed out. The reconciler covers anything that slips
-through; a failed insert is a `500` plus an ERROR log, never a silent success.
+### 📬 Cloud Tasks between webhook and VM
+
+With `PROVISION_QUEUE` configured (Terraform does this), the webhook does not create the VM inline: it
+verifies the signature, enqueues one Cloud Tasks task named after the job id and answers GitHub at once.
+A redelivery of the same job collides on the task name and is ignored. Cloud Tasks then calls
+`POST /tasks/provision` (OIDC token of the provisioner service account) which re-checks that the job is
+still queued and has no live VM, and creates it through the same path (operation wait, zone fallback,
+`gcp-auto` ladder). A capacity error answers `503` so the queue retries with backoff (30 s to 5 min, 8
+attempts by default); a task that exhausts its attempts is left to the reconciler, never dropped.
+Without a queue the webhook creates inline, which takes about 10 seconds (more with zone fallback) and
+exceeds GitHub's 10-second delivery timeout; the VM is still created and a failed insert is a `500`
+plus an ERROR log, never a silent success.
 
 ### 🔁 Reconciler
 
@@ -252,6 +260,9 @@ Every decision is logged with job id, VM name, zone and reason. `POST /reconcile
 | `RECONCILE_MAX_CREATES`   | Max. VMs one reconcile pass creates | No (default: `20`)                                |
 | `RECONCILE_REPOSITORIES`  | Comma-separated `owner/repo` list to restrict the scan | No (default: every installed repo)  |
 | `RECONCILE_GIVE_UP_HOURS` | Stop re-provisioning a job queued longer than this | No (default: `6`)                     |
+| `MANAGER_URL`             | Public URL of this service; OIDC audience for `/tasks/provision` | No (route disabled when unset) |
+| `PROVISION_QUEUE`         | Cloud Tasks queue path (`projects/../locations/../queues/..`) for webhook hand-off | No (inline creation when unset) |
+| `PROVISION_INVOKER_EMAIL` | Service account Cloud Tasks uses to call `/tasks/provision` | No (route disabled when unset)      |
 | `PORT`                    | Web server port                | No (default: `8080`)                       |
 | `SETUP_USERNAME`          | Setup authentication username  | No (default: `cloud`)                      |
 | `SETUP_PASSWORD`          | Setup authentication password  | No (default: `GOOGLE_CLOUD_PROJECT`)       |
@@ -266,6 +277,7 @@ Every decision is logged with job id, VM name, zone and reason. `POST /reconcile
 *   `POST /setup/trigger-restart` - Restart application (requires HTTP Basic Auth)
 *   `POST /webhook` - Main GitHub webhook receiver (requires valid GitHub webhook signature)
 *   `POST /reconcile` - Reconcile queued jobs with runner VMs (requires a Google OIDC token for `RECONCILE_INVOKER_EMAIL`)
+*   `POST /tasks/provision` - Cloud Tasks handler that creates one job's VM (requires a Google OIDC token for `PROVISION_INVOKER_EMAIL`)
 
 ## 💻 Local Development
 
