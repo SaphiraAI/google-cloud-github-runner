@@ -282,14 +282,18 @@ class TestDeleteDecisions:
         assert gcloud.deleted == []
         assert report['live_vms'] == 0
 
-    def test_job_listing_failure_disables_the_delete_phase(self):
-        github = FakeGitHub(repos=[ORG_REPO, USER_REPO], jobs={ORG_REPO['full_name']: []})
-        github.list_jobs_error[USER_REPO['full_name']] = RuntimeError('503')
-        gcloud = FakeGCloud([vm('gcp-runner-old', age_minutes=45)])
+    def test_job_listing_failure_only_protects_that_repository(self):
+        """Review: one broken repository must not disable deletions for the other 86."""
+        broken = {**ORG_REPO, 'full_name': 'example-org/broken', 'html_url': 'https://github.com/example-org/broken'}
+        github = FakeGitHub(repos=[ORG_REPO, broken], jobs={ORG_REPO['full_name']: []})
+        github.list_jobs_error[broken['full_name']] = RuntimeError('403 disabled')
+        gcloud = FakeGCloud([vm('gcp-runner-old', age_minutes=45),
+                             vm('gcp-runner-broken', age_minutes=45, repo='broken')])
         report, _ = run_pass(github, gcloud)
-        assert gcloud.deleted == []
-        assert any(s.get('phase') == 'delete' for s in report['skipped'])
-        assert report['errors']
+        assert gcloud.deleted == [('gcp-runner-old', 'us-central1-b')]
+        assert any(s.get('vm') == 'gcp-runner-broken' and 'could not be listed' in s['reason'] for s in report['skipped'])
+        assert not any(s.get('phase') == 'delete' for s in report['skipped'])
+        assert report['errors'] and 'list jobs' in report['errors'][0]['error']
 
     def test_runner_listing_failure_disables_the_delete_phase(self):
         github = FakeGitHub(jobs={ORG_REPO['full_name']: []})
@@ -415,7 +419,7 @@ class TestCreateDecisions:
         assert provisioner.calls == []
         assert report['created'][0]['dry_run'] is True
 
-    def test_creation_still_happens_when_delete_phase_is_disabled(self):
+    def test_creation_still_happens_when_a_listing_fails(self):
         github = FakeGitHub(repos=[ORG_REPO, USER_REPO],
                             jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=15)]})
         github.list_jobs_error[USER_REPO['full_name']] = RuntimeError('503')
@@ -466,6 +470,29 @@ class TestRepositoryCoverage:
         report = service.run()
         assert report['repositories'] == ['example-org/example-repo']
         assert service.webhook_service.calls == []
+
+    def test_excluded_repository_vms_are_left_alone(self, monkeypatch):
+        """Excluded means neither provisioned for nor cleaned up by the reconciler."""
+        monkeypatch.setenv('RECONCILE_EXCLUDE_REPOSITORIES', 'example-org/example-repo')
+        github = FakeGitHub(repos=[ORG_REPO, USER_REPO], jobs={})
+        gcloud = FakeGCloud([vm('gcp-runner-x', age_minutes=45, job_id=9)])
+        service = ReconcileService(github_client=github, gcloud_client=gcloud, webhook_service=FakeProvisioner(), now=NOW)
+        report = service.run()
+        assert gcloud.deleted == []
+        assert any(s.get('vm') == 'gcp-runner-x' and 'excluded' in s['reason'] for s in report['skipped'])
+
+    def test_exclude_entry_matching_nothing_is_warned_about(self, caplog):
+        github = FakeGitHub(repos=[ORG_REPO], jobs={})
+        with caplog.at_level('WARNING', logger='app.services.reconcile_service'):
+            run_pass(github, FakeGCloud([]), exclude_repositories='example-org/old-name')
+        assert any('old-name' in r.message and 'cannot see' in r.message for r in caplog.records)
+
+    def test_archived_and_disabled_repositories_are_not_scanned(self):
+        archived = {**USER_REPO, 'full_name': 'octocat/archived', 'archived': True}
+        disabled = {**USER_REPO, 'full_name': 'octocat/disabled', 'disabled': True}
+        github = FakeGitHub(repos=[ORG_REPO, archived, disabled], jobs={})
+        report, _ = run_pass(github, FakeGCloud([]))
+        assert report['repositories'] == ['example-org/example-repo']
 
     def test_include_list_no_longer_exists(self, monkeypatch):
         monkeypatch.setenv('RECONCILE_REPOSITORIES', 'octocat/hello')

@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_STUCK_MINUTES = 10
 DEFAULT_MAX_CREATES = 20
 DEFAULT_CREATE_WORKERS = 4
+# Parallel GitHub listings per pass (well under GitHub's 100-concurrent secondary limit).
+LISTING_WORKERS = 8
 # A job queued longer than this is retried at a reduced rate (once per RECONCILE_SLOW_RETRY_MINUTES)
 # instead of every pass, so a template whose runner never registers does not churn a VM every
 # five minutes. It is never given up on: GitHub's own 24 h queued-job timeout is the only floor.
@@ -132,20 +134,42 @@ class ReconcileService:
             return False
         return self.now() - timestamp >= datetime.timedelta(minutes=self.stuck_minutes)
 
+    @staticmethod
+    def repo_key(owner, repo_name):
+        """Key a repository the way create_runner_instance labels VMs (sanitised owner/repo)."""
+        return f"{label_value(owner)}/{label_value(repo_name)}"
+
     def _select_repositories(self, repos):
         """
-        Every repository the App installation can see, minus RECONCILE_EXCLUDE_REPOSITORIES
-        (comma-separated owner/repo). There is deliberately no include list: a repository the
-        App is installed on is covered without configuration.
+        Every repository the App installation can see, minus archived/disabled ones (they cannot
+        hold a queued job) and RECONCILE_EXCLUDE_REPOSITORIES (comma-separated owner/repo). There
+        is deliberately no include list: a repository the App is installed on is covered without
+        configuration. Excluded repositories are neither provisioned for nor cleaned up.
+
+        Returns:
+            tuple(list, set): the repositories to scan, and the label keys of excluded ones.
         """
         excluded = {name.strip().lower() for name in self.exclude_repositories.split(',') if name.strip()}
-        if not excluded:
-            return repos
-        selected = [repo for repo in repos if (repo.get('full_name') or '').lower() not in excluded]
-        dropped = [repo.get('full_name') for repo in repos if repo not in selected]
+        selected, dropped, excluded_keys, seen = [], [], set(), set()
+        for repo in repos:
+            full_name = (repo.get('full_name') or '')
+            owner_login = (repo.get('owner') or {}).get('login') or ''
+            seen.add(full_name.lower())
+            if full_name.lower() in excluded:
+                dropped.append(full_name)
+                excluded_keys.add(self.repo_key(owner_login, full_name.split('/', 1)[-1]))
+            elif repo.get('archived') or repo.get('disabled'):
+                logger.info("Reconcile %s: skipping %s repository %s", self.run_id,
+                            'archived' if repo.get('archived') else 'disabled', full_name)
+            else:
+                selected.append(repo)
         if dropped:
             logger.info("Reconcile %s: excluding %s by configuration", self.run_id, ', '.join(dropped))
-        return selected
+        unknown = sorted(excluded - seen)
+        if unknown:
+            logger.warning("Reconcile %s: RECONCILE_EXCLUDE_REPOSITORIES names repositories the App cannot see "
+                           "(renamed or removed?): %s", self.run_id, ', '.join(unknown))
+        return selected, excluded_keys
 
     @staticmethod
     def _scope_for_repo(repo):
@@ -199,23 +223,34 @@ class ReconcileService:
 
         token = self.github_client.get_installation_access_token()
         repos = self.github_client.list_installation_repositories(token=token)
-        repos = self._select_repositories(repos)
+        repos, excluded_keys = self._select_repositories(repos)
         report['repositories'] = [repo.get('full_name') for repo in repos]
 
         # --- GitHub view: jobs of every run that is queued or in progress -------------------
         queued_jobs = []           # (repo, job) for queued jobs on a template label
         running_runner_names = set()
         jobs_by_id = {}
-        listing_failed = False
-        for repo in repos:
-            full_name = repo.get('full_name')
-            try:
-                jobs = self.github_client.list_workflow_jobs(full_name, token=token)
-            except Exception as e:
-                listing_failed = True
-                logger.error("Reconcile %s: could not list jobs of %s: %s", self.run_id, full_name, e)
-                report['errors'].append({'repo': full_name, 'error': f"list jobs: {e}"})
-                continue
+        failed_repo_keys = set()  # repositories whose jobs could not be listed: their VMs are left alone
+
+        def list_jobs(repo):
+            return repo, self.github_client.list_workflow_jobs(repo.get('full_name'), token=token)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=LISTING_WORKERS) as pool:
+            futures = {pool.submit(list_jobs, repo): repo for repo in repos}
+            results = []
+            for future in concurrent.futures.as_completed(futures):
+                repo = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    full_name = repo.get('full_name') or ''
+                    owner_login = (repo.get('owner') or {}).get('login') or ''
+                    failed_repo_keys.add(self.repo_key(owner_login, full_name.split('/', 1)[-1]))
+                    logger.error("Reconcile %s: could not list jobs of %s: %s", self.run_id, full_name, e)
+                    report['errors'].append({'repo': full_name, 'error': f"list jobs: {e}"})
+        # Deterministic order (by repository name) so logs and reports are stable.
+        results.sort(key=lambda item: item[0].get('full_name') or '')
+        for repo, jobs in results:
             for job in jobs:
                 jobs_by_id[str(job.get('id'))] = (repo, job)
                 status = job.get('status')
@@ -245,7 +280,7 @@ class ReconcileService:
             owner_login = (repo.get('owner') or {}).get('login') or ''
             repo_name = (repo.get('full_name') or '/').split('/', 1)[1]
             # Keyed the way create_runner_instance writes the labels (sanitised GCE label values).
-            scope_by_repo[f"{label_value(owner_login)}/{label_value(repo_name)}"] = scope
+            scope_by_repo[self.repo_key(owner_login, repo_name)] = scope
             if scope[0] == 'org':
                 scope_by_owner[label_value(owner_login)] = scope
         runners_by_scope = {}
@@ -260,15 +295,18 @@ class ReconcileService:
 
         # --- Delete phase ---------------------------------------------------------------
         deleted_job_ids = set()
-        if listing_failed or runners_failed:
-            # Without a complete picture of what is running we cannot prove a VM is idle.
-            logger.error("Reconcile %s: skipping the delete phase because a GitHub listing failed", self.run_id)
+        if runners_failed:
+            # Without the runner registrations we cannot prove any VM is idle.
+            logger.error("Reconcile %s: skipping the delete phase because a runner listing failed", self.run_id)
             report['skipped'].append({'phase': 'delete', 'reason': 'incomplete GitHub view'})
         else:
+            if failed_repo_keys:
+                logger.error("Reconcile %s: leaving VMs of %d repositor%s alone because their jobs could not be listed",
+                             self.run_id, len(failed_repo_keys), 'y' if len(failed_repo_keys) == 1 else 'ies')
             for vm in live_vms:
                 self._reconcile_vm(
                     vm, token, running_runner_names, runners_by_scope, scope_by_owner, scope_by_repo,
-                    jobs_by_id, deleted_job_ids, report, dry_run,
+                    jobs_by_id, deleted_job_ids, report, dry_run, failed_repo_keys | excluded_keys,
                 )
 
         # --- Create phase ---------------------------------------------------------------
@@ -303,7 +341,7 @@ class ReconcileService:
     # ------------------------------------------------------------------
 
     def _reconcile_vm(self, vm, token, running_runner_names, runners_by_scope, scope_by_owner, scope_by_repo,
-                      jobs_by_id, deleted_job_ids, report, dry_run):
+                      jobs_by_id, deleted_job_ids, report, dry_run, untouchable_repo_keys=frozenset()):
         name = vm['name']
         zone = vm['zone']
         labels = vm.get('labels') or {}
@@ -327,6 +365,9 @@ class ReconcileService:
 
         owner = (labels.get('gha-owner') or '').lower()
         repo_label = (labels.get('gha-repo') or '').lower()
+        if f"{owner}/{repo_label}" in untouchable_repo_keys:
+            # Excluded by configuration, or its jobs could not be listed this pass: no safe decision.
+            return skip('its repository is excluded or its jobs could not be listed this pass')
         scope = scope_by_owner.get(owner) or scope_by_repo.get(f"{owner}/{repo_label}")
         if scope is None:
             return skip('owner/repo labels do not match any installed repository')

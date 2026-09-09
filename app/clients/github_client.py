@@ -180,6 +180,8 @@ class GitHubClient:
             {
                 'full_name': repo.get('full_name'),
                 'html_url': repo.get('html_url'),
+                'archived': bool(repo.get('archived')),
+                'disabled': bool(repo.get('disabled')),
                 'owner': {
                     'login': repo.get('owner', {}).get('login'),
                     'type': repo.get('owner', {}).get('type'),

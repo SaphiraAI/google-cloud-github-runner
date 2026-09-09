@@ -232,7 +232,8 @@ registers leaves a VM with no job, and a job cancelled while queued never produc
 Cloud Scheduler therefore calls `POST /reconcile` every few minutes (OIDC-authenticated). One pass:
 
 *   lists the queued jobs on `gcp-*` labels of every repository the GitHub App is installed on (enumerated
-    from the installation each pass, no list to maintain; `RECONCILE_EXCLUDE_REPOSITORIES` can drop some), and
+    from the installation each pass, no list to maintain; archived and disabled repositories are skipped and
+    `RECONCILE_EXCLUDE_REPOSITORIES` can drop some, whose VMs are then also left alone), and
     the live runner VMs (label `gha-job-id`);
 *   creates a VM for a job queued longer than `RECONCILE_STUCK_MINUTES` with no VM (same path as the webhook);
 *   deletes a VM older than `RECONCILE_STUCK_MINUTES` whose job is not running (never registered, or finished
@@ -269,7 +270,7 @@ value or pauses the scheduler to prove each one fires.
 | `RECONCILE_AUDIENCE`      | OIDC audience expected on `/reconcile` calls | No (route disabled when unset)            |
 | `RECONCILE_STUCK_MINUTES` | Age after which the reconciler creates or deletes | No (default: `10`)                   |
 | `RECONCILE_MAX_CREATES`   | Max. VMs one reconcile pass creates | No (default: `20`)                                |
-| `RECONCILE_EXCLUDE_REPOSITORIES` | Comma-separated `owner/repo` list the reconciler ignores; every other installed repo is scanned | No (default: none) |
+| `RECONCILE_EXCLUDE_REPOSITORIES` | Comma-separated `owner/repo` list the reconciler neither provisions for nor cleans up; every other installed repo is scanned | No (default: none) |
 | `RECONCILE_SLOW_RETRY_HOURS` | Jobs queued longer than this are retried at a reduced rate (never dropped) | No (default: `6`) |
 | `RECONCILE_SLOW_RETRY_MINUTES` | Interval between attempts for such jobs | No (default: `60`)                         |
 | `RECONCILE_INTERVAL_MINUTES` | Minutes between passes (matches the scheduler) | No (default: `5`)                      |

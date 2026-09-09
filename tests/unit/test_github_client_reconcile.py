@@ -144,6 +144,7 @@ class TestInstallationRepositories:
         repos = client.list_installation_repositories(token='tok')
         assert repos == [{
             'full_name': 'example-org/example-repo', 'html_url': 'https://github.com/example-org/example-repo',
+            'archived': False, 'disabled': False,
             'owner': {'login': 'example-org', 'type': 'Organization', 'html_url': 'https://github.com/example-org'},
         }]
         assert mock_requests.get.call_args.args[0] == 'https://api.github.com/installation/repositories'
@@ -188,27 +189,39 @@ class TestRateLimitVisibility:
 
 
 class TestInstallationRepositoryEnumeration:
-    @patch('app.clients.github_client.requests')
-    def test_pagination_is_complete_for_101_repositories(self, mock_requests, client):
-        """Positive control: two pages (100 + 1) yield all 101 repositories."""
-        page2 = 'https://api.github.com/installation/repositories?per_page=100&page=2'
+    @staticmethod
+    def _paged_installation(total):
+        """Fake GET for /installation/repositories with 100 repositories per page and Link headers."""
+        base = 'https://api.github.com/installation/repositories'
 
         def repo(i):
             return {'full_name': f'example-org/repo-{i}', 'html_url': f'https://github.com/example-org/repo-{i}',
                     'owner': {'login': 'example-org', 'type': 'Organization', 'html_url': 'https://github.com/example-org'}}
 
         def fake_get(url, headers=None, params=None, timeout=None):
-            if url == 'https://api.github.com/installation/repositories':
-                return _response({'total_count': 101, 'repositories': [repo(i) for i in range(100)]}, next_url=page2)
-            if url == page2:
-                return _response({'total_count': 101, 'repositories': [repo(100)]})
-            raise AssertionError(url)
+            page = 1 if url == base else int(url.rsplit('page=', 1)[1])
+            start = (page - 1) * 100
+            items = [repo(i) for i in range(start, min(start + 100, total))]
+            next_url = f'{base}?per_page=100&page={page + 1}' if start + 100 < total else None
+            return _response({'total_count': total, 'repositories': items}, next_url=next_url)
+        return fake_get
 
-        mock_requests.get.side_effect = fake_get
+    @patch('app.clients.github_client.requests')
+    def test_pagination_is_complete_for_101_repositories(self, mock_requests, client):
+        """Positive control: two pages (100 + 1) yield all 101 repositories."""
+        mock_requests.get.side_effect = self._paged_installation(101)
         repos = client.list_installation_repositories(token='tok')
         assert len(repos) == 101
         assert repos[-1]['full_name'] == 'example-org/repo-100'
         assert len({r['full_name'] for r in repos}) == 101
+
+    @patch('app.clients.github_client.requests')
+    def test_enumeration_goes_beyond_the_generic_page_cap(self, mock_requests, client):
+        """22 pages (2101 repositories) exceed MAX_PAGES=20; the installation listing must still be complete."""
+        mock_requests.get.side_effect = self._paged_installation(2101)
+        repos = client.list_installation_repositories(token='tok')
+        assert len(repos) == 2101
+        assert mock_requests.get.call_count == 22
 
     @patch('app.clients.github_client.requests')
     def test_hitting_the_page_cap_is_logged(self, mock_requests, client, caplog):
