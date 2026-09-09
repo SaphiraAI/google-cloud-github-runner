@@ -11,10 +11,10 @@ logger = logging.getLogger(__name__)
 class WebhookService:
     """Service to process GitHub webhook payloads and trigger runner lifecycle actions."""
 
-    def __init__(self):
-        """Initialize WebhookService with API clients."""
-        self.github_client = GitHubClient()
-        self.gcloud_client = GCloudClient()
+    def __init__(self, github_client=None, gcloud_client=None):
+        """Initialize WebhookService with API clients (injectable for the reconciler and tests)."""
+        self.github_client = github_client or GitHubClient()
+        self.gcloud_client = gcloud_client or GCloudClient()
 
     def _validate_payload(self, payload):
         """Validate webhook payload structure and content."""
@@ -80,12 +80,13 @@ class WebhookService:
                     template_name,
                     delivery_id,
                 )
-                instance_name = self._handle_queued_job(
+                instance_name = self.provision_runner(
                     template_name,
                     repo_url,
                     repo_owner_url,
                     repo_name,
                     org_name,
+                    job_id=workflow_job.get('id'),
                     delivery_id=delivery_id,
                 )
                 return {'action': 'created', 'runner_name': instance_name}
@@ -107,16 +108,21 @@ class WebhookService:
 
         return {'action': 'ignored', 'runner_name': None}
 
-    def _handle_queued_job(
+    def provision_runner(
         self,
         template_name,
         repo_url,
         repo_owner_url,
         repo_name,
         org_name,
+        job_id=None,
         delivery_id=None,
+        name_suffix='',
     ):
-        """Handle queued workflow job.
+        """Create a runner VM for a queued workflow job.
+
+        Shared by the webhook (queued event) and the reconciler, so both go through the
+        same registration-token, operation-wait and zone-fallback path.
 
         Returns:
             str or None: The name of the created runner instance.
@@ -134,6 +140,8 @@ class WebhookService:
                     template_name,
                     repo_name,
                     delivery_id=delivery_id,
+                    job_id=job_id,
+                    name_suffix=name_suffix,
                 )
             elif repo_name:
                 # Create GitHub Actions runner instance for repository
@@ -141,7 +149,8 @@ class WebhookService:
                     repo_name=repo_name, delivery_id=delivery_id
                 )
                 return self.gcloud_client.create_runner_instance(
-                    token, repo_url, template_name, repo_name, delivery_id=delivery_id
+                    token, repo_url, template_name, repo_name, delivery_id=delivery_id,
+                    job_id=job_id, name_suffix=name_suffix,
                 )
             else:
                 logger.error(

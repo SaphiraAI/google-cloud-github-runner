@@ -2,6 +2,7 @@
 Google Cloud Client for managing GCE instances.
 """
 import concurrent.futures
+import datetime
 import logging
 import os
 import re
@@ -19,6 +20,12 @@ DEFAULT_INSERT_TIMEOUT_SECONDS = 120
 ZONE_CACHE_SECONDS = 600
 # Instance label that records the zone the VM landed in after zone fallback.
 ZONE_LABEL = 'gha-zone'
+# Instance label that records the GitHub workflow job id the VM was created for.
+JOB_ID_LABEL = 'gha-job-id'
+# Instance name prefix shared by every runner VM the manager creates.
+INSTANCE_NAME_PREFIX = 'gcp-runner-'
+# Instance states that count as "alive" for the reconciler.
+LIVE_INSTANCE_STATUSES = ('PROVISIONING', 'STAGING', 'RUNNING', 'REPAIRING')
 
 # Operation error codes that mean "this zone cannot serve the request right now".
 # https://cloud.google.com/compute/docs/troubleshooting/troubleshooting-vm-creation
@@ -176,6 +183,8 @@ class GCloudClient:
         template_name,
         instance_label=None,
         delivery_id=None,
+        job_id=None,
+        name_suffix='',
     ):
         """
         Create a new GCE instance for a GitHub Actions runner.
@@ -186,6 +195,11 @@ class GCloudClient:
             template_name (str): The name of the instance template to use.
             instance_label (str): Label to add to the Instance for Cost Tracking.
             delivery_id (str): The GitHub webhook delivery ID for log correlation.
+            job_id (int|str): GitHub workflow job id. When given, the instance is named after it
+                (``gcp-runner-<job_id>``) so two creators racing for the same job in the same zone
+                collide on the name instead of both provisioning, and it is stored in the
+                ``gha-job-id`` label for the reconciler.
+            name_suffix (str): Optional suffix appended to a job-derived name (e.g. ``-r``).
 
         Returns:
             str: The name of the created instance.
@@ -209,11 +223,14 @@ class GCloudClient:
 
         # Name must start with a lowercase letter followed by up to 62 lowercase letters,
         # numbers, or hyphens, and cannot end with a hyphen.
-        instance_uuid = uuid.uuid4().hex[:16]
-        if instance_template_resource.name.startswith("dependabot"):
-            instance_name = f"gcp-runner-dependabot-{instance_uuid}"
+        if job_id is not None:
+            instance_id = f"{job_id}{name_suffix}"
         else:
-            instance_name = f"gcp-runner-{instance_uuid}"
+            instance_id = uuid.uuid4().hex[:16]
+        if instance_template_resource.name.startswith("dependabot"):
+            instance_name = f"{INSTANCE_NAME_PREFIX}dependabot-{instance_id}"
+        else:
+            instance_name = f"{INSTANCE_NAME_PREFIX}{instance_id}"
 
         logger.info(
             "Creating GCE instance %s with template %s, delivery_id: %s",
@@ -234,6 +251,8 @@ class GCloudClient:
                 "gha-repo": repo.lower(),
                 "gha-runner": template_name
             }
+        if job_id is not None:
+            labels[JOB_ID_LABEL] = str(job_id)
 
         # Set metadata (startup script) - use shlex.quote to prevent command injection
         runner_group_flag = ""
@@ -284,6 +303,16 @@ class GCloudClient:
                     zone,
                     delivery_id,
                 )
+            except gapi_exceptions.Conflict as e:
+                # Another creator (webhook or reconciler) already inserted this name in this zone.
+                logger.info(
+                    "Instance %s already exists in zone %s; another creator won (%s), delivery_id: %s",
+                    instance_name,
+                    zone,
+                    e,
+                    delivery_id,
+                )
+                return instance_name
             except Exception as e:
                 logger.error(
                     "Failed to create instance %s in zone %s: %s, delivery_id: %s",
@@ -396,6 +425,39 @@ class GCloudClient:
             return []
         # Guard against MagicMock-like objects in tests returning non-Errors items.
         return [e for e in errors if isinstance(getattr(e, 'code', None), str)]
+
+    def list_runner_instances(self):
+        """
+        Every runner VM the manager created, in any zone of the project.
+
+        Returns:
+            list[dict]: name, zone, status, labels (dict), created_at (aware datetime or None).
+        """
+        # https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/aggregatedList
+        # Filtered client-side on the name prefix: the project holds few VMs and a server-side
+        # filter that silently matched nothing would hide every runner from the reconciler.
+        request = compute_v1.AggregatedListInstancesRequest(project=self.project_id)
+        instances = []
+        for zone_key, scoped_list in self.instance_client.aggregated_list(request=request):
+            for instance in getattr(scoped_list, 'instances', None) or []:
+                if not str(instance.name).startswith(INSTANCE_NAME_PREFIX):
+                    continue
+                zone = str(getattr(instance, 'zone', '') or '').rstrip('/').split('/')[-1] or str(zone_key).split('/')[-1]
+                created_at = None
+                raw = getattr(instance, 'creation_timestamp', None)
+                if raw:
+                    try:
+                        created_at = datetime.datetime.fromisoformat(str(raw))
+                    except ValueError:
+                        created_at = None
+                instances.append({
+                    'name': instance.name,
+                    'zone': zone,
+                    'status': str(getattr(instance, 'status', '') or ''),
+                    'labels': dict(getattr(instance, 'labels', None) or {}),
+                    'created_at': created_at,
+                })
+        return instances
 
     def find_instance_zone(self, instance_name, delivery_id=None):
         """

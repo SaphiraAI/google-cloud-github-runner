@@ -15,7 +15,7 @@ data "google_artifact_registry_docker_image" "container-image-github-runners-man
 module "cloud_run_github_runners_manager" {
   source     = "git::https://github.com/GoogleCloudPlatform/cloud-foundation-fabric//modules/cloud-run-v2?ref=v53.0.0"
   project_id = module.project.project_id
-  name       = "github-runners-manager-${local.region_shortnames[var.region]}"
+  name       = local.github_runners_manager_name
   type       = "SERVICE"
   region     = var.region
   containers = {
@@ -32,6 +32,10 @@ module "cloud_run_github_runners_manager" {
         GOOGLE_CLOUD_PROJECT = var.project_id
         GOOGLE_CLOUD_ZONE    = "${var.region}-${var.zone}"
         GITHUB_RUNNER_GROUP  = var.github_runner_group
+        # Reconciler (POST /reconcile) is only accepted from this caller with this audience
+        RECONCILE_INVOKER_EMAIL = module.service-account-github-runners-reconciler.email
+        RECONCILE_AUDIENCE      = local.github_runners_manager_audience
+        RECONCILE_STUCK_MINUTES = tostring(var.github_runners_reconcile_stuck_minutes)
       }
       env_from_key = {
         GITHUB_APP_ID = {
@@ -58,6 +62,8 @@ module "cloud_run_github_runners_manager" {
     }
   }
   service_config = {
+    # A reconcile pass may wait for several Compute insert operations; keep the request timeout above it.
+    timeout = "${var.github_runners_reconcile_attempt_deadline}s"
     # Disable IAM permission check
     # There should be no requirement to pass the roles/run.invoker to the IAM block to enable public access.
     # This allows for the org policy domain restricted sharing org policy remain enabled.
@@ -77,6 +83,7 @@ module "cloud_run_github_runners_manager" {
   deletion_protection = false
   depends_on = [
     google_secret_manager_secret_version.secret-version-default,
-    time_sleep.wait_for_service_account_cloud_run
+    time_sleep.wait_for_service_account_cloud_run,
+    time_sleep.wait_for_service_account_reconciler
   ]
 }

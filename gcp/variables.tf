@@ -6,6 +6,7 @@ variable "apis" {
     "artifactregistry.googleapis.com",
     "cloudbuild.googleapis.com",
     "cloudresourcemanager.googleapis.com",
+    "cloudscheduler.googleapis.com",
     "compute.googleapis.com",
     "iam.googleapis.com",
     "logging.googleapis.com",
@@ -104,6 +105,38 @@ variable "github_runners_manager_max_instance_count" {
   validation {
     condition     = var.github_runners_manager_max_instance_count >= var.github_runners_manager_min_instance_count
     error_message = "Maximum instance count must be larger than or equal to github_runners_manager_min_instance_count."
+  }
+}
+
+# Cron schedule for the reconciler that creates VMs for stuck queued jobs and deletes idle runner VMs
+variable "github_runners_reconcile_schedule" {
+  description = "Cloud Scheduler cron schedule (UTC) for the reconcile pass of the GitHub Actions Runners manager"
+  type        = string
+  default     = "*/5 * * * *"
+  nullable    = false
+}
+
+# A queued job without a VM, or a VM whose job is not running, is acted on after this many minutes
+variable "github_runners_reconcile_stuck_minutes" {
+  description = "Minutes a queued job may wait without a VM (or a VM may exist without a running job) before the reconciler acts"
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.github_runners_reconcile_stuck_minutes >= 3
+    error_message = "Stuck minutes must be at least 3 so freshly created runners have time to register."
+  }
+}
+
+# Upper bound for one reconcile pass; creations block on the Compute insert operation and zone fallback
+variable "github_runners_reconcile_attempt_deadline" {
+  description = "Cloud Scheduler attempt deadline in seconds for one reconcile pass (max. 1800)"
+  type        = number
+  default     = 600
+
+  validation {
+    condition     = var.github_runners_reconcile_attempt_deadline >= 60 && var.github_runners_reconcile_attempt_deadline <= 1800
+    error_message = "Attempt deadline must be between 60 and 1800 seconds."
   }
 }
 
