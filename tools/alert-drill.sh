@@ -35,10 +35,23 @@ CONSOLE="https://console.cloud.google.com/monitoring/alerting/incidents?project=
 
 case "$MODE" in
 	stuck)
-		echo "Writing a synthetic heartbeat with oldest_queued_job_age_seconds=${AGE} to project ${PROJECT}..."
-		gcloud logging write reconcile-alert-drill \
-			"{\"event\": \"reconcile_heartbeat\", \"message\": \"RECONCILE_HEARTBEAT run_id=drill oldest_queued_job_age_seconds=${AGE}\", \"run_id\": \"drill\", \"oldest_queued_job_age_seconds\": ${AGE}, \"queued_jobs\": 1, \"live_vms\": 0, \"dry_run\": true}" \
-			--payload-type=json --severity=INFO --project="${PROJECT}"
+		# The alert conditions require resource.type = cloud_run_revision, so write the synthetic entry
+		# through the Logging API with that resource (gcloud logging write only writes "global" entries).
+		SERVICE="$(gcloud run services list --project="${PROJECT}" --region="${REGION}" --format='value(metadata.name)' \
+			--filter='metadata.name ~ github-runners-manager-' 2>/dev/null | head -n 1 || true)"
+		[ -n "$SERVICE" ] || { echo "no github-runners-manager-* Cloud Run service found in ${PROJECT}/${REGION}" >&2; exit 1; }
+		echo "Writing a synthetic heartbeat (resource cloud_run_revision/${SERVICE}) with oldest_queued_job_age_seconds=${AGE}..."
+		BODY=$(cat <<JSON
+{"entries": [{"logName": "projects/${PROJECT}/logs/reconcile-alert-drill", "severity": "INFO",
+  "resource": {"type": "cloud_run_revision", "labels": {"project_id": "${PROJECT}", "location": "${REGION}",
+    "service_name": "${SERVICE}", "revision_name": "alert-drill", "configuration_name": "${SERVICE}"}},
+  "jsonPayload": {"event": "reconcile_heartbeat", "message": "RECONCILE_HEARTBEAT run_id=drill oldest_queued_job_age_seconds=${AGE}",
+    "run_id": "drill", "oldest_queued_job_age_seconds": ${AGE}, "queued_jobs": 1, "live_vms": 0, "dry_run": true}}]}
+JSON
+)
+		curl -sS -f -X POST "https://logging.googleapis.com/v2/entries:write" \
+			-H "Authorization: Bearer $(gcloud auth print-access-token)" \
+			-H "Content-Type: application/json" --data "${BODY}" >/dev/null
 		echo "Entry written. Confirm ingestion:"
 		gcloud logging read 'logName:"reconcile-alert-drill" AND jsonPayload.event="reconcile_heartbeat"' \
 			--project="${PROJECT}" --limit=1 --freshness=10m --format='value(timestamp,jsonPayload.oldest_queued_job_age_seconds)'

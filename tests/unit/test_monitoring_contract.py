@@ -54,5 +54,7 @@ class TestHeartbeatContract:
     def test_synthetic_entry_from_the_drill_script_matches_the_filter(self):
         """The drill writes the same shape with gcloud logging write; keep the two in step."""
         script = open(os.path.join(os.path.dirname(TF_PATH), '..', 'tools', 'alert-drill.sh')).read()
-        assert f'\\"event\\": \\"{HEARTBEAT_EVENT}\\"' in script
-        assert '\\"oldest_queued_job_age_seconds\\"' in script
+        assert f'"event": "{HEARTBEAT_EVENT}"' in script
+        assert '"oldest_queued_job_age_seconds"' in script
+        assert '"type": "cloud_run_revision"' in script, 'the alert conditions require this resource type'
+        assert _tf().count('resource.type=\\"cloud_run_revision\\"') == 2

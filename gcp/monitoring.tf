@@ -1,8 +1,9 @@
 # Alert policies for the runner manager (no notification channels: alerts only, by design).
 # Both read the structured heartbeat the reconciler writes after every completed pass
 # (jsonPayload.event = "reconcile_heartbeat", see app/services/reconcile_service.py).
-# The filters match on the event key only, so a synthetic entry written with
-# `gcloud logging write ... --payload-type=json` (tools/alert-drill.sh) exercises the same path.
+# The metric filters match on the event key only; the alert conditions additionally require
+# resource.type = cloud_run_revision (a Monitoring API rule), so tools/alert-drill.sh writes its
+# synthetic entry with that resource type through the Logging API.
 
 locals {
   reconcile_heartbeat_filter = "jsonPayload.event=\"reconcile_heartbeat\""
@@ -64,7 +65,8 @@ resource "google_monitoring_alert_policy" "github-runners-reconciler-heartbeat-m
     display_name = "reconcile_heartbeat absent"
 
     condition_absent {
-      filter   = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.github-runners-reconcile-heartbeat.name}\""
+      # Alert filters must restrict resource.type; the heartbeat is written by the Cloud Run service.
+      filter   = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.github-runners-reconcile-heartbeat.name}\" AND resource.type=\"cloud_run_revision\""
       duration = "${var.github_runners_alert_heartbeat_missing_seconds}s"
 
       aggregations {
@@ -104,7 +106,7 @@ resource "google_monitoring_alert_policy" "github-runners-stuck-job" {
     display_name = "oldest_queued_job_age_seconds above threshold"
 
     condition_threshold {
-      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.github-runners-oldest-queued-job-age.name}\""
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.github-runners-oldest-queued-job-age.name}\" AND resource.type=\"cloud_run_revision\""
       comparison      = "COMPARISON_GT"
       threshold_value = var.github_runners_alert_stuck_job_seconds
       duration        = "0s"
