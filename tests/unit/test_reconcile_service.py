@@ -106,13 +106,23 @@ class FakeGitHub:
 
 
 class FakeGCloud:
-    def __init__(self, vms=None):
+    def __init__(self, vms=None, templates_for=None):
         self.vms = vms or []
         self.deleted = []
         self.delete_error = None
+        self.templates_for = templates_for  # None = every label has a template
+        self.template_list_calls = 0
 
     def list_runner_instances(self):
         return list(self.vms)
+
+    def list_templates(self):
+        self.template_list_calls += 1
+        return ['templates']
+
+    def has_template_for(self, label, templates=None):
+        assert templates == ['templates'], 'must reuse the per-pass template list'
+        return True if self.templates_for is None else label in self.templates_for
 
     def delete_runner_instance(self, name, delivery_id=None, zone=None):
         if self.delete_error:
@@ -452,3 +462,86 @@ class TestRepositoryFilter:
         service = ReconcileService(github_client=FakeGitHub(repos=[ORG_REPO, USER_REPO]), gcloud_client=FakeGCloud(),
                                    webhook_service=FakeProvisioner(), now=NOW)
         assert service.run()['repositories'] == ['octocat/hello']
+
+
+class TestLabelMatching:
+    def test_repository_with_dot_in_name_matches_sanitised_labels(self):
+        dotted = {
+            'full_name': 'octocat/hello.js',
+            'html_url': 'https://github.com/octocat/hello.js',
+            'owner': {'login': 'octocat', 'type': 'User', 'html_url': 'https://github.com/octocat'},
+        }
+        github = FakeGitHub(repos=[dotted], jobs={'octocat/hello.js': [job(5, 'completed')]},
+                            runners={('repo', 'octocat/hello.js'): []})
+        gcloud = FakeGCloud([vm('gcp-runner-5', age_minutes=30, job_id=5, owner='octocat', repo='hello-js')])
+        report, _ = run_pass(github, gcloud)
+        assert gcloud.deleted == [('gcp-runner-5', 'us-central1-b')]
+        assert ('get_workflow_job', 'octocat/hello.js', '5') in github.calls
+
+
+class TestReviewFindings:
+    def test_jobs_without_a_template_do_not_consume_the_creation_budget(self):
+        """Review finding 1: 25 old jobs on a typo label must not starve one real stuck job."""
+        typo = [job(100 + i, 'queued', age_minutes=60, labels=('gcp-typo',)) for i in range(25)]
+        real = job(999, 'queued', age_minutes=15)
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: typo + [real]})
+        gcloud = FakeGCloud([], templates_for={LABEL})
+        provisioner = FakeProvisioner()
+        service = ReconcileService(github_client=github, gcloud_client=gcloud, webhook_service=provisioner,
+                                   stuck_minutes=10, max_creates=20, create_workers=1, now=NOW)
+        report = service.run()
+        assert [c['job_id'] for c in provisioner.calls] == [999]
+        assert len([s for s in report['skipped'] if 'no matching instance template' in s['reason']]) == 25
+        assert gcloud.template_list_calls == 1, 'templates are listed once per pass'
+
+    def test_runner_that_registered_after_the_listing_gates_the_delete(self):
+        """Review finding 4: a VM with no runner in the pass-start snapshot is re-checked before deletion."""
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=30)]})
+        gcloud = FakeGCloud([vm('gcp-runner-1', age_minutes=30, job_id=1)])
+        calls = {'n': 0}
+        original = github.list_runners
+
+        def list_runners(org_name=None, repo_name=None, token=None):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return original(org_name=org_name, repo_name=repo_name, token=token)
+            return [runner('gcp-runner-1', busy=True)]
+        github.list_runners = list_runners
+        report, _ = run_pass(github, gcloud)
+        assert gcloud.deleted == []
+        assert any('registered since the listing and is busy' in r for r in reasons(report, 'kept'))
+
+    def test_runner_that_registered_after_the_listing_is_deregistered_before_delete(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'completed')]})
+        gcloud = FakeGCloud([vm('gcp-runner-1', age_minutes=30, job_id=1)])
+        calls = {'n': 0}
+
+        def list_runners(org_name=None, repo_name=None, token=None):
+            calls['n'] += 1
+            return [] if calls['n'] == 1 else [runner('gcp-runner-1', runner_id=9)]
+        github.list_runners = list_runners
+        report, _ = run_pass(github, gcloud)
+        assert github.deleted_runners == [(('org', 'example-org'), 9)]
+        assert gcloud.deleted == [('gcp-runner-1', 'us-central1-b')]
+
+    def test_relist_failure_skips_the_vm(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'completed')]})
+        gcloud = FakeGCloud([vm('gcp-runner-1', age_minutes=30, job_id=1)])
+        calls = {'n': 0}
+
+        def list_runners(org_name=None, repo_name=None, token=None):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return []
+            raise RuntimeError('GitHub 502')
+        github.list_runners = list_runners
+        report, _ = run_pass(github, gcloud)
+        assert gcloud.deleted == []
+        assert any('could not re-list runners' in r for r in reasons(report, 'skipped'))
+
+    def test_jobs_queued_longer_than_give_up_hours_are_not_retried(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=7 * 60),
+                                                          job(2, 'queued', age_minutes=15)]})
+        report, provisioner = run_pass(github, FakeGCloud([]))
+        assert [c['job_id'] for c in provisioner.calls] == [2]
+        assert any('more than 6 hours' in r for r in reasons(report, 'skipped'))

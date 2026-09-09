@@ -21,7 +21,7 @@ import os
 import uuid
 
 from app.clients import GitHubClient, GCloudClient
-from app.clients.gcloud_client import JOB_ID_LABEL, LIVE_INSTANCE_STATUSES
+from app.clients.gcloud_client import JOB_ID_LABEL, LIVE_INSTANCE_STATUSES, label_value
 from app.services.webhook_service import WebhookService
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_STUCK_MINUTES = 10
 DEFAULT_MAX_CREATES = 20
 DEFAULT_CREATE_WORKERS = 4
+# A job queued longer than this is no longer re-provisioned (a template whose runner never
+# registers would otherwise churn a VM every pass until GitHub cancels the job after 24 h).
+DEFAULT_GIVE_UP_HOURS = 6
 # Suffix for VMs the reconciler creates, so a late webhook for the same job never races on
 # the same instance name in a different zone; both VMs carry the same gha-job-id label.
 RECONCILE_NAME_SUFFIX = '-r'
@@ -73,6 +76,7 @@ class ReconcileService:
         create_workers=None,
         now=None,
         repositories=None,
+        give_up_hours=None,
     ):
         self.github_client = github_client or GitHubClient()
         self.gcloud_client = gcloud_client or GCloudClient()
@@ -86,6 +90,8 @@ class ReconcileService:
         self.create_workers = create_workers if create_workers is not None \
             else _env_int('RECONCILE_CREATE_WORKERS', DEFAULT_CREATE_WORKERS)
         self.repositories_filter = os.environ.get('RECONCILE_REPOSITORIES', '') if repositories is None else repositories
+        self.give_up_hours = give_up_hours if give_up_hours is not None \
+            else _env_int('RECONCILE_GIVE_UP_HOURS', DEFAULT_GIVE_UP_HOURS)
         self._now = now
         self.run_id = f"reconcile-{uuid.uuid4().hex[:8]}"
 
@@ -205,10 +211,12 @@ class ReconcileService:
         scope_by_repo = {}
         for repo in repos:
             scope = self._scope_for_repo(repo)
-            owner_login = ((repo.get('owner') or {}).get('login') or '').lower()
-            scope_by_repo[(repo.get('full_name') or '').lower()] = scope
+            owner_login = (repo.get('owner') or {}).get('login') or ''
+            repo_name = (repo.get('full_name') or '/').split('/', 1)[1]
+            # Keyed the way create_runner_instance writes the labels (sanitised GCE label values).
+            scope_by_repo[f"{label_value(owner_login)}/{label_value(repo_name)}"] = scope
             if scope[0] == 'org':
-                scope_by_owner[owner_login] = scope
+                scope_by_owner[label_value(owner_login)] = scope
         runners_by_scope = {}
         runners_failed = False
         for scope in set(scope_by_repo.values()):
@@ -298,12 +306,29 @@ class ReconcileService:
             else:
                 reason = f"job is {status}" + (f"/{job.get('conclusion')}" if job.get('conclusion') else '')
         else:
+            status = None
             if runner is None:
                 reason = 'no job label and no registered runner'
             elif runner.get('status') == 'online':
                 reason = 'no job label and the runner is idle'
             else:
                 reason = f"no job label and the runner is {runner.get('status')}"
+
+        if runner is None:
+            # The runner listing was taken at pass start; a runner that registered since could be
+            # busy by now. Re-list the scope so the deregister step (and GitHub's refusal to remove a
+            # busy runner) always gates the delete.
+            try:
+                fresh = {r['name']: r for r in self._list_runners(scope, token)}
+            except Exception as e:
+                return skip(f"could not re-list runners before deleting: {e}")
+            runner = fresh.get(name)
+            if runner is not None:
+                if runner.get('busy'):
+                    return keep('runner registered since the listing and is busy')
+                if job_id and status == 'queued' and runner.get('status') == 'online':
+                    return keep('runner registered since the listing; job still queued')
+                reason += ' (runner registered during the pass; deregistering first)'
 
         if self._retire_vm(vm, runner, scope, token, reason, report, dry_run) and job_id:
             deleted_job_ids.add(str(job_id))
@@ -346,6 +371,8 @@ class ReconcileService:
     def _create_missing(self, queued_jobs, live_vms, deleted_job_ids, report, dry_run):
         covered = {str((vm.get('labels') or {}).get(JOB_ID_LABEL)) for vm in live_vms}
         candidates = []
+        templates = None
+        provisionable = {}  # label -> bool, resolved once per pass against the template list
         for repo, job in queued_jobs:
             job_id = str(job.get('id'))
             created_at = parse_github_time(job.get('created_at'))
@@ -356,6 +383,21 @@ class ReconcileService:
             if job_id in covered:
                 continue
             if not self._is_stuck(created_at):
+                continue
+            if created_at is not None and self.now() - created_at >= datetime.timedelta(hours=self.give_up_hours):
+                logger.warning("Reconcile %s: job %s (%s, %s) has been queued since %s; giving up on it after %d h",
+                               self.run_id, job_id, repo.get('full_name'), job.get('name'), created_at,
+                               self.give_up_hours)
+                report['skipped'].append({**entry, 'reason': f"queued for more than {self.give_up_hours} hours; not retried"})
+                continue
+            # Jobs without a template must not consume the per-pass creation budget.
+            label = template_label_for(job.get('labels'))
+            if label not in provisionable:
+                if templates is None:
+                    templates = self.gcloud_client.list_templates()
+                provisionable[label] = self.gcloud_client.has_template_for(label, templates=templates)
+            if not provisionable[label]:
+                report['skipped'].append({**entry, 'reason': f"no matching instance template for label {label}"})
                 continue
             candidates.append((created_at, repo, job))
         candidates.sort(key=lambda item: item[0])

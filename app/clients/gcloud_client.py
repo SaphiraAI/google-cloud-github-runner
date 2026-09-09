@@ -52,6 +52,12 @@ class ZoneCapacityError(InstanceCreationError):
         super().__init__(message)
         self.code = code
         self.zone = zone
+        self.attempts = [self]  # one entry per zone tried, set by _insert_across_zones
+
+
+def label_value(value):
+    """Make a string a valid GCE label value: lowercase, [a-z0-9_-], at most 63 characters."""
+    return re.sub(r'[^a-z0-9_-]', '-', str(value or '').lower())[:63]
 
 
 def classify_operation_errors(errors):
@@ -151,12 +157,21 @@ class GCloudClient:
             )
         return zones
 
-    def _get_template_name(self, template_name):
+    def list_templates(self):
+        """All regional instance templates of the project's region (empty list on error, logged)."""
+        try:
+            return list(self.instance_templates_client.list(project=self.project_id, region=self.region))
+        except Exception as e:
+            logger.error("Could not list instance templates in region %s: %s", self.region, e)
+            return []
+
+    def _get_template_name(self, template_name, templates=None):
         """
         Find a matching instance template by name prefix.
 
         Args:
             template_name (str): The name prefix to search for.
+            templates (list): Preloaded result of list_templates() to avoid one API call per lookup.
 
         Returns:
             google.cloud.compute_v1.InstanceTemplate or None: The matching template resource.
@@ -166,15 +181,19 @@ class GCloudClient:
         # logger.info(f"Prefix: {prefix}")
         # Create regex pattern: prefix followed by dash, at least 12 digits, and optional alphanumeric characters
         pattern = re.compile(f"^{re.escape(prefix)}-\\d{{14,}}[a-z0-9]*$")
-        try:
-            # List all templates to find one that matches the pattern
-            for template in self.instance_templates_client.list(project=self.project_id, region=self.region):
-                # logger.info(f"Template: {template.name}")
-                if pattern.match(template.name):
-                    return template
-            return None
-        except Exception:
-            return None
+        if templates is None:
+            templates = self.list_templates()
+        for template in templates:
+            # logger.info(f"Template: {template.name}")
+            if pattern.match(template.name):
+                return template
+        return None
+
+    def has_template_for(self, label, templates=None):
+        """True when a job label has a matching instance template (resolved against ``templates`` if given)."""
+        if templates is None:
+            templates = self.list_templates()
+        return self._get_template_name(label, templates=templates) is not None
 
     def create_runner_instance(
         self,
@@ -202,16 +221,14 @@ class GCloudClient:
             name_suffix (str): Optional suffix appended to a job-derived name (e.g. ``-r``).
 
         Returns:
-            str: The name of the created instance.
+            str or None: The name of the created instance, or None when no template matches.
+
+        Raises:
+            ZoneCapacityError: no zone of the region had capacity.
+            InstanceCreationError: any other creation failure.
         """
-        instance_template_resource = self._get_template_name(template_name)
-        if instance_template_resource:
-            logger.info(
-                "Found matching instance template: %s, delivery_id: %s",
-                instance_template_resource.name,
-                delivery_id,
-            )
-        else:
+        template = self._get_template_name(template_name)
+        if template is None:
             logger.warning(
                 "No matching instance template found for label '%s' in region %s. "
                 "Skipping instance creation. delivery_id: %s",
@@ -220,6 +237,11 @@ class GCloudClient:
                 delivery_id,
             )
             return None
+        logger.info(
+            "Found matching instance template: %s, delivery_id: %s",
+            template.name,
+            delivery_id,
+        )
 
         # Name must start with a lowercase letter followed by up to 62 lowercase letters,
         # numbers, or hyphens, and cannot end with a hyphen.
@@ -227,34 +249,50 @@ class GCloudClient:
             instance_id = f"{job_id}{name_suffix}"
         else:
             instance_id = uuid.uuid4().hex[:16]
-        if instance_template_resource.name.startswith("dependabot"):
+        if template.name.startswith("dependabot"):
             instance_name = f"{INSTANCE_NAME_PREFIX}dependabot-{instance_id}"
         else:
             instance_name = f"{INSTANCE_NAME_PREFIX}{instance_id}"
-
-        logger.info(
-            "Creating GCE instance %s with template %s, delivery_id: %s",
-            instance_name,
-            instance_template_resource.self_link,
-            delivery_id,
-        )
-
-        # Set instance name
-        instance_resource = compute_v1.Instance()  # google.cloud.compute_v1.types.Instance
-        instance_resource.name = instance_name
 
         labels = {}
         if instance_label is not None:
             owner, repo = instance_label.split("/")
             labels = {
-                "gha-owner": owner.lower(),
-                "gha-repo": repo.lower(),
-                "gha-runner": template_name
+                "gha-owner": label_value(owner),
+                "gha-repo": label_value(repo),
+                "gha-runner": label_value(template_name),
             }
         if job_id is not None:
             labels[JOB_ID_LABEL] = str(job_id)
 
-        # Set metadata (startup script) - use shlex.quote to prevent command injection
+        logger.info(
+            "Creating GCE instance %s with template %s, delivery_id: %s",
+            instance_name,
+            template.self_link,
+            delivery_id,
+        )
+
+        def metadata_for(zone):
+            return self._build_metadata(registration_token, repo_url, template_name, instance_name, job_id)
+
+        try:
+            self._insert_across_zones(instance_name, template, labels, metadata_for, delivery_id)
+        except ZoneCapacityError as e:
+            # Every zone of the region ran out of capacity; _insert_across_zones logged each attempt.
+            tried = ', '.join(f"{a.zone} ({a.code})" for a in e.attempts)
+            logger.error(
+                "No zone in region %s could create instance %s; tried %s, delivery_id: %s",
+                self.region,
+                instance_name,
+                tried,
+                delivery_id,
+            )
+            raise
+        return instance_name
+
+    def _build_metadata(self, registration_token, repo_url, template_name, instance_name, job_id):
+        """Instance metadata: the startup script that registers the runner."""
+        # Use shlex.quote to prevent command injection
         runner_group_flag = ""
         if self.github_runner_group:
             runner_group_flag = f" --runnergroup {shlex.quote(self.github_runner_group)}"
@@ -268,6 +306,7 @@ class GCloudClient:
             f"{runner_group_flag} "
             "--ephemeral "
             "--unattended "
+            "--replace "
             "--no-default-labels "
             "--disableupdate && "
             "sudo -u runner ./run.sh"
@@ -278,21 +317,33 @@ class GCloudClient:
             compute_v1.Items(key="vmDnsSetting", value="ZonalOnly"),
             compute_v1.Items(key="block-project-ssh-keys", value="true"),
         ]
-        instance_resource.metadata = metadata
+        return metadata
 
-        # Try the configured zone first, then the other zones of the region (templates are
-        # regional). Only capacity errors move on to the next zone; anything else fails at once.
-        zones = self.candidate_zones()
+    def _insert_across_zones(self, instance_name, template, labels, metadata_for, delivery_id=None):
+        """
+        Insert ``instance_name`` from ``template`` in the first zone of the region with capacity.
+
+        Tries the configured zone first, then the other UP zones of the region (templates are
+        regional). Only capacity errors move on to the next zone; anything else raises at once.
+
+        Returns:
+            str: the zone the instance was created in (or already existed in).
+
+        Raises:
+            ZoneCapacityError: every zone failed for capacity reasons; ``.attempts`` lists them.
+        """
         capacity_failures = []
-        for zone in zones:
-            labels[ZONE_LABEL] = zone
-            instance_resource.labels = dict(labels)
+        for zone in self.candidate_zones():
+            instance_resource = compute_v1.Instance()  # google.cloud.compute_v1.types.Instance
+            instance_resource.name = instance_name
+            instance_resource.labels = {**labels, ZONE_LABEL: zone}
+            instance_resource.metadata = metadata_for(zone)
             # https://docs.cloud.google.com/python/docs/reference/compute/latest/google.cloud.compute_v1.types.InsertInstanceRequest
             request = compute_v1.InsertInstanceRequest(
                 project=self.project_id,
                 zone=zone,
                 instance_resource=instance_resource,
-                source_instance_template=instance_template_resource.self_link
+                source_instance_template=template.self_link
             )
             try:
                 # https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/insert
@@ -312,7 +363,7 @@ class GCloudClient:
                     e,
                     delivery_id,
                 )
-                return instance_name
+                return zone
             except Exception as e:
                 logger.error(
                     "Failed to create instance %s in zone %s: %s, delivery_id: %s",
@@ -334,25 +385,20 @@ class GCloudClient:
                 "Instance %s created in zone %s with template %s, delivery_id: %s",
                 instance_name,
                 zone,
-                instance_template_resource.name,
+                template.name,
                 delivery_id,
             )
-            return instance_name
+            return zone
 
         tried = ', '.join(f"{e.zone} ({e.code})" for e in capacity_failures)
-        logger.error(
-            "No zone in region %s could create instance %s; tried %s, delivery_id: %s",
-            self.region,
-            instance_name,
-            tried,
-            delivery_id,
-        )
         last = capacity_failures[-1]
-        raise ZoneCapacityError(
+        error = ZoneCapacityError(
             f"No zone in region {self.region} could create {instance_name}; tried {tried}",
             code=last.code,
             zone=last.zone,
-        ) from last
+        )
+        error.attempts = capacity_failures
+        raise error from last
 
     def _wait_for_insert(self, operation, instance_name, zone, delivery_id=None):
         """
@@ -403,7 +449,8 @@ class GCloudClient:
         # Defensive: a DONE operation that carries errors but did not raise is still a failure.
         errors = self._operation_errors(operation)
         if errors:
-            _, summary = classify_operation_errors(errors)
+            retry_elsewhere, summary = classify_operation_errors(errors)
+            code = str(getattr(errors[0], 'code', '') or '')
             logger.error(
                 "Instance creation for %s in zone %s finished with errors: %s, delivery_id: %s",
                 instance_name,
@@ -411,6 +458,10 @@ class GCloudClient:
                 summary,
                 delivery_id,
             )
+            if retry_elsewhere:
+                raise ZoneCapacityError(
+                    f"Zone {zone} has no capacity for {instance_name}: {summary}", code=code, zone=zone
+                )
             raise InstanceCreationError(
                 f"Instance creation for {instance_name} in zone {zone} finished with errors: {summary}"
             )

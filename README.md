@@ -213,6 +213,11 @@ Instance creation waits for the Compute Engine operation and reports its result:
 (stockout, quota) fall back to the other zones of the region, in a stable order, before failing loudly.
 The zone a VM landed in is stored in the `gha-zone` label and deletion looks the VM up by name across zones.
 
+Trade-off: an insert operation takes about 10 seconds (more with zone fallback), longer than GitHub's
+10-second webhook delivery timeout. The VM is still created and the outcome is logged, but GitHub's
+delivery log may show the `queued` delivery as timed out. The reconciler covers anything that slips
+through; a failed insert is a `500` plus an ERROR log, never a silent success.
+
 ### 🔁 Reconciler
 
 Webhooks are best effort. A dropped delivery leaves a job queued with no VM, a runner that never

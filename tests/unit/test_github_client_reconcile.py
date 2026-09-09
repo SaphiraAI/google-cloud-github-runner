@@ -9,10 +9,11 @@ import requests
 from app.clients.github_client import GitHubClient
 
 
-def _response(json_body, status=200, next_url=None):
+def _response(json_body, status=200, next_url=None, headers=None):
     response = MagicMock()
     response.status_code = status
     response.json.return_value = json_body
+    response.headers = headers or {}
     response.links = {'next': {'url': next_url}} if next_url else {}
     if status >= 400:
         response.raise_for_status.side_effect = requests.HTTPError(f'{status}', response=response)
@@ -56,6 +57,7 @@ class TestListWorkflowJobs:
         assert calls['https://api.github.com/repos/o/r/actions/runs/10/jobs'][0]['filter'] == 'latest'
         statuses = [p['status'] for p in calls['https://api.github.com/repos/o/r/actions/runs']]
         assert statuses == ['queued', 'in_progress']
+        assert all(p['created'].startswith('>=') for p in calls['https://api.github.com/repos/o/r/actions/runs'])
 
     @patch('app.clients.github_client.requests')
     def test_follows_link_pagination(self, mock_requests, client):
@@ -173,3 +175,13 @@ class TestReadRetries:
             client.list_runners(org_name='example-org', token='tok')
         assert mock_requests.get.call_count == 1
         sleep.assert_not_called()
+
+
+class TestRateLimitVisibility:
+    @patch('app.clients.github_client.requests')
+    def test_low_remaining_budget_is_logged(self, mock_requests, client, caplog):
+        mock_requests.get.return_value = _response({'runners': []},
+                                                   headers={'X-RateLimit-Remaining': '42', 'X-RateLimit-Reset': '1'})
+        with caplog.at_level('WARNING', logger='app.clients.github_client'):
+            client.list_runners(org_name='example-org', token='tok')
+        assert any('rate limit is low' in r.message and '42' in r.message for r in caplog.records)

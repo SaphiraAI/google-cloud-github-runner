@@ -66,7 +66,9 @@ def verify_google_oidc_token(authorization_header, audience, allowed_emails):
         # Lazy import keeps app start-up independent of google-auth's HTTP transport.
         from google.auth.transport import requests as google_requests
         from google.oauth2 import id_token as google_id_token
-        claims = google_id_token.verify_oauth2_token(token, google_requests.Request(), audience=audience)
+        # A few seconds of skew: Google-minted tokens are occasionally rejected as "used too early".
+        claims = google_id_token.verify_oauth2_token(token, google_requests.Request(), audience=audience,
+                                                     clock_skew_in_seconds=10)
     except Exception as e:
         return None, f'invalid token: {e}'
     email = (claims.get('email') or '').lower()

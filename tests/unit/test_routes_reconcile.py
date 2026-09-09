@@ -59,6 +59,7 @@ class TestVerifyGoogleOidcToken:
         claims, reason = verify_google_oidc_token('Bearer t', AUD, [INVOKER])
         assert claims is not None and reason == ''
         assert verify.call_args.kwargs['audience'] == AUD
+        assert verify.call_args.kwargs['clock_skew_in_seconds'] == 10
 
 
 class TestReconcileRoute:

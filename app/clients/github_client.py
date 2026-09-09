@@ -1,6 +1,7 @@
 """
 GitHub Client for authenticating and interacting with the GitHub API.
 """
+import datetime
 import os
 import time
 import jwt
@@ -11,6 +12,8 @@ REQUEST_TIMEOUT = 30  # seconds
 MAX_PAGES = 20  # safety cap for paginated GitHub list endpoints (100 items per page)
 READ_RETRIES = 3  # attempts for read-only GitHub calls that answer 5xx (GitHub returns sporadic 502s)
 READ_RETRY_BACKOFF = 1.0  # seconds, doubled per attempt
+RUN_LOOKBACK_HOURS = 25  # only runs created within this window can still hold queued jobs
+RATE_LIMIT_WARN_BELOW = 500  # warn when the installation's remaining GitHub API budget drops under this
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +135,10 @@ class GitHubClient:
         for attempt in range(READ_RETRIES):
             response = requests.get(url, headers=self._headers(token), params=params, timeout=REQUEST_TIMEOUT)
             if response.status_code < 500:
+                remaining = response.headers.get('X-RateLimit-Remaining') if hasattr(response, 'headers') else None
+                if remaining is not None and str(remaining).isdigit() and int(remaining) < RATE_LIMIT_WARN_BELOW:
+                    logger.warning("GitHub API rate limit is low: %s requests remaining (resets at %s)",
+                                   remaining, response.headers.get('X-RateLimit-Reset'))
                 return response
             logger.warning("GitHub %s answered %s (attempt %d/%d)", url, response.status_code, attempt + 1, READ_RETRIES)
             if attempt < READ_RETRIES - 1:
@@ -193,10 +200,12 @@ class GitHubClient:
         token = token or self.get_installation_access_token()
         jobs = []
         seen_runs = set()
+        # GitHub cancels jobs queued for 24 h, so older runs cannot hold a live queued job.
+        since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=RUN_LOOKBACK_HOURS))
         for status in run_statuses:
             runs = self._get_paginated(
                 f'https://api.github.com/repos/{repo_name}/actions/runs', token, 'workflow_runs',
-                params={'status': status},
+                params={'status': status, 'created': f">={since.strftime('%Y-%m-%dT%H:%M:%SZ')}"},
             )
             for run in runs:
                 run_id = run.get('id')
