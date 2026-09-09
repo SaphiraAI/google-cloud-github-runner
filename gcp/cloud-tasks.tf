@@ -12,11 +12,16 @@ module "service-account-github-runners-provisioner" {
   name         = "github-runners-provisioner"
   display_name = "Cloud Tasks - GitHub Actions Runners provisioner (Terraform managed)"
   iam = {
-    # The manager attaches this identity to the tasks it creates.
+    # The manager attaches this identity to the tasks it creates, and the Cloud Tasks service
+    # agent mints the OIDC token when it dispatches them.
     "roles/iam.serviceAccountUser" = [
-      module.service-account-cloud-run-github-runners-manager.iam_email
+      module.service-account-cloud-run-github-runners-manager.iam_email,
+      "serviceAccount:service-${module.project.number}@gcp-sa-cloudtasks.iam.gserviceaccount.com",
     ]
   }
+  depends_on = [
+    module.project # the service agent exists once cloudtasks.googleapis.com is enabled
+  ]
 }
 
 # Wait for service account to be fully propagated in Google Cloud IAM

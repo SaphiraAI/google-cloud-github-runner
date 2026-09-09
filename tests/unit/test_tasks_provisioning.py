@@ -29,6 +29,8 @@ def tasks_env(monkeypatch):
     monkeypatch.setenv('PROVISION_QUEUE', QUEUE)
     monkeypatch.setenv('MANAGER_URL', MANAGER_URL + '/')
     monkeypatch.setenv('PROVISION_INVOKER_EMAIL', INVOKER)
+    # the client is shared per process; start each test without one
+    monkeypatch.setattr('app.clients.tasks_client._shared_client', None)
 
 
 class TestTasksClient:
@@ -55,6 +57,7 @@ class TestTasksClient:
         assert request.parent == QUEUE
         task = request.task
         assert task.name == f'{QUEUE}/tasks/job-4242', 'task name is the job id: redeliveries collide'
+        assert task.dispatch_deadline.seconds == 1800, 'one attempt may run as long as the longest provisioning'
         assert task.http_request.url == MANAGER_URL + '/tasks/provision'
         assert task.http_request.oidc_token.service_account_email == INVOKER
         assert task.http_request.oidc_token.audience == MANAGER_URL
@@ -148,7 +151,6 @@ class TestProvisionFromTask:
     @pytest.mark.parametrize('job,reason', [
         ({'status': 'in_progress'}, 'job is in_progress'),
         ({'status': 'completed'}, 'job is completed'),
-        (None, 'job is not found'),
     ])
     def test_skips_when_job_no_longer_queued(self, job, reason):
         service, github, gcloud, _ = _service()
@@ -175,6 +177,21 @@ class TestProvisionFromTask:
             {'name': 'gcp-runner-4242', 'zone': 'us-central1-c', 'status': 'STOPPING', 'labels': {'gha-job-id': '4242'}},
         ]
         assert service.provision_from_task(TASK)['action'] == 'created'
+
+    def test_job_not_found_still_provisions(self, caplog):
+        """A 404 can mean the installation lacks actions:read; a spare VM is cheaper than a stuck job."""
+        service, github, gcloud, _ = _service()
+        github.get_workflow_job.return_value = None
+        with caplog.at_level('WARNING', logger='app.services.webhook_service'):
+            assert service.provision_from_task(TASK)['action'] == 'created'
+        assert any('not found' in r.message for r in caplog.records)
+
+    def test_foreign_urls_are_rejected(self):
+        service, github, gcloud, _ = _service()
+        github.get_workflow_job.return_value = {'status': 'queued'}
+        with pytest.raises(ValueError):
+            service.provision_from_task({**TASK, 'repo_url': 'https://evil.example.com/x/y'})
+        gcloud.create_runner_instance.assert_not_called()
 
     def test_recheck_failure_still_provisions(self):
         service, github, gcloud, _ = _service()
@@ -228,6 +245,15 @@ class TestProvisionRoute:
                                headers={'Authorization': 'Bearer t', 'X-CloudTasks-TaskRetryCount': '2'})
         assert response.status_code == 200
         assert response.get_json()['runner_name'] == 'gcp-runner-4242'
+
+    @patch('app.routes.tasks.WebhookService')
+    @patch('google.oauth2.id_token.verify_oauth2_token')
+    def test_invalid_task_body_is_not_retried(self, verify, service_class, client, route_env):
+        verify.return_value = _claims()
+        service_class.return_value.provision_from_task.side_effect = ValueError('Invalid repo_url in provisioning task')
+        response = client.post('/tasks/provision', json=TASK, headers={'Authorization': 'Bearer t'})
+        assert response.status_code == 200
+        assert response.get_json()['status'] == 'skipped'
 
     @pytest.mark.parametrize('error,status', [
         (ZoneCapacityError('no capacity', code='ZONE_RESOURCE_POOL_EXHAUSTED', zone='us-central1-b'), 503),

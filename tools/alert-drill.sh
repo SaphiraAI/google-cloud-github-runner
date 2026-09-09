@@ -28,11 +28,9 @@ REGION="$2"
 MODE="$3"
 AGE="${4:-3600}"
 
-case "$REGION" in
-	us-central1) SHORT="uc1" ;;
-	*) SHORT="$(echo "$REGION" | sed -E 's/^([a-z])[a-z]*-([a-z]+)([0-9]+)$/\1\2\3/' | cut -c1-4)" ;;
-esac
-JOB="github-runners-reconcile-${SHORT}"
+# The scheduler job is github-runners-reconcile-<region short name>; look it up instead of guessing.
+JOB="$(gcloud scheduler jobs list --project="${PROJECT}" --location="${REGION}" --format='value(name.basename())' \
+	--filter='name ~ github-runners-reconcile-' 2>/dev/null | head -n 1 || true)"
 CONSOLE="https://console.cloud.google.com/monitoring/alerting/incidents?project=${PROJECT}"
 
 case "$MODE" in
@@ -45,8 +43,10 @@ case "$MODE" in
 		gcloud logging read 'logName:"reconcile-alert-drill" AND jsonPayload.event="reconcile_heartbeat"' \
 			--project="${PROJECT}" --limit=1 --freshness=10m --format='value(timestamp,jsonPayload.oldest_queued_job_age_seconds)'
 		echo "Watch for the incident (log-based metrics take 1-3 minutes to appear): ${CONSOLE}"
+		echo "Note: this entry also counts as a heartbeat for the next 15 minutes."
 		;;
 	heartbeat)
+		[ -n "$JOB" ] || { echo "no github-runners-reconcile-* scheduler job found in ${PROJECT}/${REGION}" >&2; exit 1; }
 		echo "This pauses Cloud Scheduler job ${JOB} in ${PROJECT}/${REGION}; the reconciler stops until 'resume'."
 		read -r -p "Type PAUSE to continue: " answer
 		[ "$answer" = "PAUSE" ] || { echo "aborted"; exit 1; }
@@ -55,6 +55,7 @@ case "$MODE" in
 		echo "Then run: $0 ${PROJECT} ${REGION} resume"
 		;;
 	resume)
+		[ -n "$JOB" ] || { echo "no github-runners-reconcile-* scheduler job found in ${PROJECT}/${REGION}" >&2; exit 1; }
 		gcloud scheduler jobs resume "${JOB}" --location="${REGION}" --project="${PROJECT}"
 		echo "Resumed. The next pass writes a heartbeat and the incident should close."
 		;;

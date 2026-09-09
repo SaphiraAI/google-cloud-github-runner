@@ -206,6 +206,10 @@ class WebhookService:
         repo_name = payload.get('repo_name')
         delivery_id = payload.get('delivery_id')
         result = {'action': 'skipped', 'runner_name': None, 'job_id': job_id, 'reason': ''}
+        for key in ('repo_url', 'repo_owner_url'):
+            url = payload.get(key) or ''
+            if url and not re.match(r'^https://github\.com/[\w\-\.]+(/[\w\-\.]+)?$', url):
+                raise ValueError(f"Invalid {key} in provisioning task")
 
         if job_id is not None and repo_name:
             try:
@@ -213,9 +217,14 @@ class WebhookService:
             except Exception as e:
                 logger.warning("Could not re-check job %s before provisioning (%s); provisioning anyway", job_id, e)
                 job = {'status': 'queued'}
-            status = (job or {}).get('status')
-            if job is None or status != 'queued':
-                result['reason'] = f"job is {status or 'not found'}"
+            if job is None:
+                # 404 also means the installation lacks actions:read; an unneeded VM is cleaned in
+                # ten minutes, a job left without a runner is not. Provision.
+                logger.warning("Job %s not found on GitHub when re-checking; provisioning anyway", job_id)
+                job = {'status': 'queued'}
+            status = job.get('status')
+            if status != 'queued':
+                result['reason'] = f"job is {status}"
                 logger.info("Provisioning task for job %s skipped: %s, delivery_id: %s", job_id, result['reason'],
                             delivery_id)
                 return result

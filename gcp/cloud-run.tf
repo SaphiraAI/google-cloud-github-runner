@@ -70,8 +70,9 @@ module "cloud_run_github_runners_manager" {
     }
   }
   service_config = {
-    # A reconcile pass may wait for several Compute insert operations; keep the request timeout above it.
-    timeout = "${var.github_runners_reconcile_attempt_deadline}s"
+    # A provisioning task may wait for several Compute insert operations across zones and ladder
+    # rungs (Cloud Tasks dispatch deadline 30 min); keep the request timeout at or above it.
+    timeout = "${max(var.github_runners_manager_request_timeout, var.github_runners_reconcile_attempt_deadline)}s"
     # Matches gunicorn's thread count (Dockerfile): webhook requests block on the insert operation.
     max_concurrency = 32
     # Disable IAM permission check

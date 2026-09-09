@@ -140,10 +140,16 @@ variable "github_runners_provision_max_attempts" {
 }
 # Cron schedule for the reconciler that creates VMs for stuck queued jobs and deletes idle runner VMs
 variable "github_runners_reconcile_schedule" {
-  description = "Cloud Scheduler cron schedule (UTC) for the reconcile pass of the GitHub Actions Runners manager"
+  description = "Cloud Scheduler cron schedule (UTC) for the reconcile pass of the GitHub Actions Runners manager; must be of the form */N * * * *"
   type        = string
   default     = "*/5 * * * *"
   nullable    = false
+
+  validation {
+    # The reconciler gates reduced-rate retries on the pass interval, which is read from this shape.
+    condition     = can(regex("^\\*/([1-9]|[1-5][0-9]) \\* \\* \\* \\*$", var.github_runners_reconcile_schedule))
+    error_message = "Schedule must be '*/N * * * *' with N between 1 and 59 minutes."
+  }
 }
 
 # A queued job without a VM, or a VM whose job is not running, is acted on after this many minutes
@@ -214,6 +220,19 @@ variable "github_runners_reconcile_repositories" {
   validation {
     condition     = alltrue([for repo in var.github_runners_reconcile_repositories : can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo))])
     error_message = "Repositories must be given as owner/repo."
+  }
+}
+
+# Cloud Run request timeout of the manager; must cover a provisioning task (Cloud Tasks dispatch
+# deadline, 30 min) and a reconcile pass
+variable "github_runners_manager_request_timeout" {
+  description = "Cloud Run request timeout in seconds for the GitHub Actions Runners manager (covers the longest provisioning task)"
+  type        = number
+  default     = 1800
+
+  validation {
+    condition     = var.github_runners_manager_request_timeout >= 60 && var.github_runners_manager_request_timeout <= 3600
+    error_message = "Request timeout must be between 60 and 3600 seconds."
   }
 }
 

@@ -19,6 +19,7 @@ import datetime
 import json
 import logging
 import os
+import sys
 import uuid
 
 from app.clients import GitHubClient, GCloudClient
@@ -52,7 +53,8 @@ def emit_structured(event, message, **fields):
     (jsonPayload), which log-based metrics and alerts can read; the plain logger line stays too.
     """
     record = {'severity': 'INFO', 'message': message, 'event': event, **fields}
-    print(json.dumps(record, default=str), flush=True)
+    sys.stdout.write(json.dumps(record, default=str) + '\n')  # one write, so lines cannot interleave
+    sys.stdout.flush()
     logger.info("%s", message)
 
 
@@ -419,6 +421,8 @@ class ReconcileService:
             created_at = parse_github_time(job.get('created_at'))
             entry = {'job_id': job_id, 'repo': repo.get('full_name'), 'job': job.get('name')}
             if job_id in deleted_job_ids:
+                logger.warning("Reconcile %s: job %s (%s): its VM was deleted in this pass; retrying next pass",
+                               self.run_id, job_id, repo.get('full_name'))
                 report['skipped'].append({**entry, 'reason': 'its VM was deleted in this pass; retry next pass'})
                 continue
             if job_id in covered:
@@ -428,7 +432,9 @@ class ReconcileService:
             if created_at is not None and self.now() - created_at >= datetime.timedelta(hours=self.slow_retry_hours):
                 # Never give up: keep trying, but once per slow interval instead of every pass, and say so loudly.
                 age_minutes = int((self.now() - created_at).total_seconds() // 60)
-                due = age_minutes % self.slow_retry_minutes < self.interval_minutes
+                # Two pass intervals wide so a pass that runs a few seconds late cannot miss the
+                # window; a second consecutive attempt is prevented by the VM the first one created.
+                due = age_minutes % self.slow_retry_minutes < 2 * self.interval_minutes
                 logger.warning(
                     "Reconcile %s: job %s (%s, %s) has been queued for %d h with no runner; %s",
                     self.run_id, job_id, repo.get('full_name'), job.get('name'), age_minutes // 60,
@@ -451,11 +457,15 @@ class ReconcileService:
                     templates = self.gcloud_client.list_templates()
                 provisionable[label] = self.gcloud_client.has_template_for(label, templates=templates)
             if not provisionable[label]:
+                logger.warning("Reconcile %s: job %s (%s, %s) is queued on label %s but no instance template matches it",
+                               self.run_id, job_id, repo.get('full_name'), job.get('name'), label)
                 report['skipped'].append({**entry, 'reason': f"no matching instance template for label {label}"})
                 continue
             candidates.append((created_at, repo, job))
         candidates.sort(key=lambda item: item[0])
         for _, repo, job in candidates[self.max_creates:]:
+            logger.warning("Reconcile %s: job %s (%s) deferred to the next pass (more than %d creations)",
+                           self.run_id, job.get('id'), repo.get('full_name'), self.max_creates)
             report['skipped'].append({'job_id': str(job.get('id')), 'repo': repo.get('full_name'),
                                       'reason': f"deferred: more than {self.max_creates} creations in one pass"})
         candidates = candidates[:self.max_creates]

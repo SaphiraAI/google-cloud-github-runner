@@ -555,6 +555,20 @@ class TestReviewFindings:
         assert not any('giving up' in r.message for r in caplog.records)
         assert report['oldest_queued_job_age_seconds'] == (7 * 60 + 20) * 60
 
+    def test_slow_retry_window_survives_a_late_pass(self):
+        """Review: a pass 12 s late must not skip a whole slow interval; the window is two intervals wide."""
+        # 6 h + 7 min: 367 % 60 = 7 < 2*5 -> still due (a pass at exactly 6h05 would have been 5, also due)
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=6 * 60 + 7),
+                                                          job(2, 'queued', age_minutes=6 * 60 + 12)]})
+        report, provisioner = run_pass(github, FakeGCloud([]))
+        assert [c['job_id'] for c in provisioner.calls] == [1]
+
+    def test_second_consecutive_due_pass_is_blocked_by_the_vm_it_created(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=6 * 60 + 5)]})
+        gcloud = FakeGCloud([vm('gcp-runner-1-r', age_minutes=4, job_id=1)])
+        report, provisioner = run_pass(github, gcloud)
+        assert provisioner.calls == []
+
 
 class TestHeartbeat:
     def test_every_completed_pass_emits_a_structured_heartbeat(self, capsys):

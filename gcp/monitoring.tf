@@ -36,11 +36,13 @@ resource "google_logging_metric" "github-runners-oldest-queued-job-age" {
     unit        = "s"
   }
 
+  # Linear 5-minute buckets so the threshold (30 min by default) is honoured to within one
+  # bucket; exponential buckets would put 17 min and 34 min in the same bucket. Up to 500 min.
   bucket_options {
-    exponential_buckets {
-      num_finite_buckets = 64
-      growth_factor      = 2
-      scale              = 1
+    linear_buckets {
+      num_finite_buckets = 100
+      width              = 300
+      offset             = 0
     }
   }
 }
@@ -54,7 +56,7 @@ resource "google_monitoring_alert_policy" "github-runners-reconciler-heartbeat-m
   severity     = "ERROR"
 
   documentation {
-    content   = "No reconcile pass has completed in ${var.github_runners_alert_heartbeat_missing_seconds} s. Check the Cloud Scheduler job ${local.github_runners_manager_name} (github-runners-reconcile-*) and the manager's logs for 'Reconcile ... failed'. Queued jobs whose webhook was dropped will not self-heal until it runs again."
+    content   = "No reconcile pass has completed in ${var.github_runners_alert_heartbeat_missing_seconds} s. Check the Cloud Scheduler job github-runners-reconcile-${local.region_shortnames[var.region]} and the logs of Cloud Run service ${local.github_runners_manager_name} for 'Reconcile ... failed'. Queued jobs whose webhook was dropped will not self-heal until it runs again."
     mime_type = "text/markdown"
   }
 
@@ -68,6 +70,9 @@ resource "google_monitoring_alert_policy" "github-runners-reconciler-heartbeat-m
       aggregations {
         alignment_period   = "300s"
         per_series_aligner = "ALIGN_SUM"
+        # Log-based metrics carry the log entry's resource labels (one series per Cloud Run
+        # revision); without a reducer every retired revision would look like a missing heartbeat.
+        cross_series_reducer = "REDUCE_SUM"
       }
     }
   }

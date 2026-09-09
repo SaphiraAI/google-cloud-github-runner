@@ -219,8 +219,7 @@ With `PROVISION_QUEUE` configured (Terraform does this), the webhook does not cr
 verifies the signature, enqueues one Cloud Tasks task named after the job id and answers GitHub at once.
 A redelivery of the same job collides on the task name and is ignored. Cloud Tasks then calls
 `POST /tasks/provision` (OIDC token of the provisioner service account) which re-checks that the job is
-still queued and has no live VM, and creates it through the same path (operation wait, zone fallback,
-`gcp-auto` ladder). A capacity error answers `503` so the queue retries with backoff (30 s to 5 min, 8
+still queued and has no live VM, and creates it through the same path (operation wait, zone fallback). A capacity error answers `503` so the queue retries with backoff (30 s to 5 min, 8
 attempts by default); a task that exhausts its attempts is left to the reconciler, never dropped.
 Without a queue the webhook creates inline, which takes about 10 seconds (more with zone fallback) and
 exceeds GitHub's 10-second delivery timeout; the VM is still created and a failed insert is a `500`
@@ -269,7 +268,7 @@ value or pauses the scheduler to prove each one fires.
 | `RECONCILE_AUDIENCE`      | OIDC audience expected on `/reconcile` calls | No (route disabled when unset)            |
 | `RECONCILE_STUCK_MINUTES` | Age after which the reconciler creates or deletes | No (default: `10`)                   |
 | `RECONCILE_MAX_CREATES`   | Max. VMs one reconcile pass creates | No (default: `20`)                                |
-| `RECONCILE_REPOSITORIES`  | Comma-separated `owner/repo` list to restrict the scan | No (default: every installed repo)  |
+| `RECONCILE_REPOSITORIES`  | Comma-separated `owner/repo` list to restrict the scan; a dropped webhook for an unlisted repo is never healed | No (default: every installed repo) |
 | `RECONCILE_SLOW_RETRY_HOURS` | Jobs queued longer than this are retried at a reduced rate (never dropped) | No (default: `6`) |
 | `RECONCILE_SLOW_RETRY_MINUTES` | Interval between attempts for such jobs | No (default: `60`)                         |
 | `RECONCILE_INTERVAL_MINUTES` | Minutes between passes (matches the scheduler) | No (default: `5`)                      |

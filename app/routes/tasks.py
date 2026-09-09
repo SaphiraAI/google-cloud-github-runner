@@ -39,6 +39,10 @@ def provision():
                 task_name, attempt, payload.get('job_id'), payload.get('delivery_id'))
     try:
         result = WebhookService().provision_from_task(payload)
+    except ValueError as e:
+        # A malformed payload will not get better with retries; the reconciler reports it.
+        logger.error("Provisioning task for job %s rejected: %s", payload.get('job_id'), e)
+        return jsonify({'status': 'skipped', 'job_id': payload.get('job_id'), 'reason': str(e)}), 200
     except ZoneCapacityError as e:
         # No zone (or rung) had capacity right now: let the queue retry with backoff.
         logger.warning("Provisioning task for job %s: no capacity (%s); asking Cloud Tasks to retry",

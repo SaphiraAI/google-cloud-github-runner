@@ -15,6 +15,12 @@ logger = logging.getLogger(__name__)
 
 TASK_NAME_PREFIX = 'job-'
 PROVISION_PATH = '/tasks/provision'
+# Longest a single attempt may run before Cloud Tasks retries it (max 30 min): a provisioning
+# attempt can wait on several insert operations across zones and ladder rungs. Keep the Cloud
+# Run request timeout at or above this, or a retry can overlap a still-running attempt.
+DISPATCH_DEADLINE_SECONDS = 1800
+
+_shared_client = None
 
 
 class TasksClient:
@@ -32,9 +38,12 @@ class TasksClient:
         return bool(self.queue and self.manager_url and self.invoker_email)
 
     def _get_client(self):
+        global _shared_client
         if self._client is None:
-            from google.cloud import tasks_v2  # imported lazily: only needed when a queue is configured
-            self._client = tasks_v2.CloudTasksClient()
+            if _shared_client is None:
+                from google.cloud import tasks_v2  # imported lazily: only needed when a queue is configured
+                _shared_client = tasks_v2.CloudTasksClient()  # one gRPC channel per process, not per request
+            self._client = _shared_client
         return self._client
 
     @staticmethod
@@ -56,8 +65,10 @@ class TasksClient:
         if not self.enabled:
             raise RuntimeError('PROVISION_QUEUE, MANAGER_URL and PROVISION_INVOKER_EMAIL must be set to enqueue')
         from google.cloud import tasks_v2
+        from google.protobuf import duration_pb2
         task = tasks_v2.Task(
             name=f"{self.queue}/tasks/{self.task_id_for(job_id)}",
+            dispatch_deadline=duration_pb2.Duration(seconds=DISPATCH_DEADLINE_SECONDS),
             http_request=tasks_v2.HttpRequest(
                 http_method=tasks_v2.HttpMethod.POST,
                 url=f"{self.manager_url}{PROVISION_PATH}",
