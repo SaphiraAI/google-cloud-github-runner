@@ -11,6 +11,7 @@ variable "apis" {
     "compute.googleapis.com",
     "iam.googleapis.com",
     "logging.googleapis.com",
+    "monitoring.googleapis.com",
     "orgpolicy.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",
@@ -177,6 +178,29 @@ variable "github_runners_reconcile_slow_retry_minutes" {
   validation {
     condition     = var.github_runners_reconcile_slow_retry_minutes >= 5 && var.github_runners_reconcile_slow_retry_minutes <= 1440
     error_message = "Slow-retry minutes must be between 5 and 1440."
+  }
+}
+
+# Alert thresholds (policies only; notification channels are configured separately)
+variable "github_runners_alert_heartbeat_missing_seconds" {
+  description = "Alert when no reconcile pass has completed for this many seconds"
+  type        = number
+  default     = 900
+
+  validation {
+    condition     = var.github_runners_alert_heartbeat_missing_seconds >= 300
+    error_message = "Heartbeat alert window must be at least 300 seconds (one scheduler interval)."
+  }
+}
+
+variable "github_runners_alert_stuck_job_seconds" {
+  description = "Alert when a queued job has waited for a runner longer than this many seconds"
+  type        = number
+  default     = 1800
+
+  validation {
+    condition     = var.github_runners_alert_stuck_job_seconds >= 60
+    error_message = "Stuck-job alert threshold must be at least 60 seconds."
   }
 }
 

@@ -245,6 +245,13 @@ The reconciler never gives up on a queued job: after `RECONCILE_SLOW_RETRY_HOURS
 Every completed pass writes a structured heartbeat line (`event=reconcile_heartbeat`, marker `RECONCILE_HEARTBEAT`)
 carrying `oldest_queued_job_age_seconds`; the monitoring alerts in `gcp/monitoring.tf` read it.
 
+### 🚨 Alerts
+
+Two Cloud Monitoring alert policies (Terraform, no notification channels attached) watch the heartbeat through
+log-based metrics: **reconciler heartbeat missing** (no completed pass for 15 minutes) and **job queued too long
+without a runner** (`oldest_queued_job_age_seconds` above 30 minutes). `tools/alert-drill.sh` feeds a synthetic
+value or pauses the scheduler to prove each one fires.
+
 ## 🔐 Environment Variables
 
 | Variable                  | Description                    | Required                                   |
