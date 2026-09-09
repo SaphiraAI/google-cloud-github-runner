@@ -128,6 +128,18 @@ variable "github_runners_reconcile_stuck_minutes" {
   }
 }
 
+# Stop re-provisioning a job that has been queued this long (a template whose runner never registers would churn)
+variable "github_runners_reconcile_give_up_hours" {
+  description = "Hours after which the reconciler stops creating VMs for a still-queued job"
+  type        = number
+  default     = 6
+
+  validation {
+    condition     = var.github_runners_reconcile_give_up_hours >= 1 && var.github_runners_reconcile_give_up_hours <= 24
+    error_message = "Give-up hours must be between 1 and 24 (GitHub cancels queued jobs after 24 h)."
+  }
+}
+
 # Restrict the reconciler to these repositories (owner/repo); empty scans every repository the App can see
 variable "github_runners_reconcile_repositories" {
   description = "Repositories (owner/repo) the reconciler scans; empty means every repository of the GitHub App installation"
