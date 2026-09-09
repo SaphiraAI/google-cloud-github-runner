@@ -430,3 +430,25 @@ class TestHelpers:
         service = ReconcileService(github_client=FakeGitHub(), gcloud_client=FakeGCloud(), webhook_service=FakeProvisioner())
         assert service.stuck_minutes == 7
         assert service.max_creates == 20
+
+
+class TestRepositoryFilter:
+    def test_all_installed_repositories_by_default(self):
+        github = FakeGitHub(repos=[ORG_REPO, USER_REPO], jobs={})
+        report, _ = run_pass(github, FakeGCloud([]))
+        assert report['repositories'] == ['example-org/example-repo', 'octocat/hello']
+
+    def test_filter_restricts_scan_case_insensitively(self, caplog):
+        github = FakeGitHub(repos=[ORG_REPO, USER_REPO],
+                            jobs={USER_REPO['full_name']: [job(1, 'queued', age_minutes=15)]})
+        with caplog.at_level('WARNING', logger='app.services.reconcile_service'):
+            report, provisioner = run_pass(github, FakeGCloud([]), repositories='example-org/example-repo, Other/Repo')
+        assert report['repositories'] == ['example-org/example-repo']
+        assert provisioner.calls == [], 'jobs of unselected repositories are not provisioned'
+        assert any('other/repo' in r.message for r in caplog.records)
+
+    def test_filter_from_environment(self, monkeypatch):
+        monkeypatch.setenv('RECONCILE_REPOSITORIES', 'octocat/hello')
+        service = ReconcileService(github_client=FakeGitHub(repos=[ORG_REPO, USER_REPO]), gcloud_client=FakeGCloud(),
+                                   webhook_service=FakeProvisioner(), now=NOW)
+        assert service.run()['repositories'] == ['octocat/hello']

@@ -72,6 +72,7 @@ class ReconcileService:
         max_creates=None,
         create_workers=None,
         now=None,
+        repositories=None,
     ):
         self.github_client = github_client or GitHubClient()
         self.gcloud_client = gcloud_client or GCloudClient()
@@ -84,6 +85,7 @@ class ReconcileService:
             else _env_int('RECONCILE_MAX_CREATES', DEFAULT_MAX_CREATES)
         self.create_workers = create_workers if create_workers is not None \
             else _env_int('RECONCILE_CREATE_WORKERS', DEFAULT_CREATE_WORKERS)
+        self.repositories_filter = os.environ.get('RECONCILE_REPOSITORIES', '') if repositories is None else repositories
         self._now = now
         self.run_id = f"reconcile-{uuid.uuid4().hex[:8]}"
 
@@ -99,6 +101,18 @@ class ReconcileService:
         if timestamp is None:
             return False
         return self.now() - timestamp >= datetime.timedelta(minutes=self.stuck_minutes)
+
+    def _select_repositories(self, repos):
+        """Restrict the scan to RECONCILE_REPOSITORIES (comma-separated full names) when set."""
+        wanted = {name.strip().lower() for name in self.repositories_filter.split(',') if name.strip()}
+        if not wanted:
+            return repos
+        selected = [repo for repo in repos if (repo.get('full_name') or '').lower() in wanted]
+        missing = wanted - {(repo.get('full_name') or '').lower() for repo in selected}
+        if missing:
+            logger.warning("Reconcile %s: RECONCILE_REPOSITORIES names repositories the App cannot see: %s",
+                           self.run_id, ', '.join(sorted(missing)))
+        return selected
 
     @staticmethod
     def _scope_for_repo(repo):
@@ -151,6 +165,7 @@ class ReconcileService:
 
         token = self.github_client.get_installation_access_token()
         repos = self.github_client.list_installation_repositories(token=token)
+        repos = self._select_repositories(repos)
         report['repositories'] = [repo.get('full_name') for repo in repos]
 
         # --- GitHub view: jobs of every run that is queued or in progress -------------------

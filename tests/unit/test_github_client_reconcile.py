@@ -145,3 +145,31 @@ class TestInstallationRepositories:
             'owner': {'login': 'example-org', 'type': 'Organization', 'html_url': 'https://github.com/example-org'},
         }]
         assert mock_requests.get.call_args.args[0] == 'https://api.github.com/installation/repositories'
+
+
+class TestReadRetries:
+    @patch('app.clients.github_client.time.sleep')
+    @patch('app.clients.github_client.requests')
+    def test_502_is_retried_then_succeeds(self, mock_requests, sleep, client):
+        mock_requests.get.side_effect = [_response({'message': 'Bad Gateway'}, status=502),
+                                         _response({'id': 5, 'status': 'queued'})]
+        assert client.get_workflow_job('o/r', 5, token='tok')['status'] == 'queued'
+        assert mock_requests.get.call_count == 2
+        sleep.assert_called_once()
+
+    @patch('app.clients.github_client.time.sleep')
+    @patch('app.clients.github_client.requests')
+    def test_persistent_5xx_raises_after_retries(self, mock_requests, sleep, client):
+        mock_requests.get.return_value = _response({'message': 'Bad Gateway'}, status=502)
+        with pytest.raises(requests.HTTPError):
+            client.list_runners(org_name='example-org', token='tok')
+        assert mock_requests.get.call_count == 3
+
+    @patch('app.clients.github_client.time.sleep')
+    @patch('app.clients.github_client.requests')
+    def test_4xx_is_not_retried(self, mock_requests, sleep, client):
+        mock_requests.get.return_value = _response({'message': 'Forbidden'}, status=403)
+        with pytest.raises(requests.HTTPError):
+            client.list_runners(org_name='example-org', token='tok')
+        assert mock_requests.get.call_count == 1
+        sleep.assert_not_called()

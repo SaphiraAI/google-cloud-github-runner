@@ -162,7 +162,6 @@ class TestCrossZoneDelete:
 
         request = instances.aggregated_list.call_args.kwargs['request']
         assert request.project == 'test-project'
-        assert 'gcp-runner-abc' in request.filter
         instances.delete.assert_called_once_with(project='test-project', zone='us-central1-c', instance='gcp-runner-abc')
         assert any('us-central1-c' in r.message and 'd-del' in r.message for r in caplog.records)
 

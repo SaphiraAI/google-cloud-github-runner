@@ -9,6 +9,8 @@ import logging
 
 REQUEST_TIMEOUT = 30  # seconds
 MAX_PAGES = 20  # safety cap for paginated GitHub list endpoints (100 items per page)
+READ_RETRIES = 3  # attempts for read-only GitHub calls that answer 5xx (GitHub returns sporadic 502s)
+READ_RETRY_BACKOFF = 1.0  # seconds, doubled per attempt
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,18 @@ class GitHubClient:
             'X-GitHub-Api-Version': '2022-11-28'
         }
 
+    def _get_with_retry(self, url, token, params=None):
+        """GET with retries on 5xx (read-only calls only). Returns the final response, not yet checked."""
+        response = None
+        for attempt in range(READ_RETRIES):
+            response = requests.get(url, headers=self._headers(token), params=params, timeout=REQUEST_TIMEOUT)
+            if response.status_code < 500:
+                return response
+            logger.warning("GitHub %s answered %s (attempt %d/%d)", url, response.status_code, attempt + 1, READ_RETRIES)
+            if attempt < READ_RETRIES - 1:
+                time.sleep(READ_RETRY_BACKOFF * (2 ** attempt))
+        return response
+
     def _get_paginated(self, url, token, key, params=None, max_pages=MAX_PAGES):
         """GET a paginated list endpoint and return the concatenated ``key`` items."""
         items = []
@@ -132,7 +146,7 @@ class GitHubClient:
         page = 0
         while url and page < max_pages:
             page += 1
-            response = requests.get(url, headers=self._headers(token), params=params, timeout=REQUEST_TIMEOUT)
+            response = self._get_with_retry(url, token, params=params)
             response.raise_for_status()
             body = response.json()
             items.extend(body.get(key, []) if isinstance(body, dict) else body)
@@ -204,11 +218,7 @@ class GitHubClient:
         """
         # https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run
         token = token or self.get_installation_access_token()
-        response = requests.get(
-            f'https://api.github.com/repos/{repo_name}/actions/jobs/{job_id}',
-            headers=self._headers(token),
-            timeout=REQUEST_TIMEOUT,
-        )
+        response = self._get_with_retry(f'https://api.github.com/repos/{repo_name}/actions/jobs/{job_id}', token)
         if response.status_code == 404:
             return None
         response.raise_for_status()

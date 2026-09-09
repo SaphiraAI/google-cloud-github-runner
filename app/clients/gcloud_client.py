@@ -426,9 +426,12 @@ class GCloudClient:
         # Guard against MagicMock-like objects in tests returning non-Errors items.
         return [e for e in errors if isinstance(getattr(e, 'code', None), str)]
 
-    def list_runner_instances(self):
+    def list_runner_instances(self, name_prefix=INSTANCE_NAME_PREFIX):
         """
         Every runner VM the manager created, in any zone of the project.
+
+        Args:
+            name_prefix (str): only instances whose name starts with this are returned.
 
         Returns:
             list[dict]: name, zone, status, labels (dict), created_at (aware datetime or None).
@@ -440,7 +443,7 @@ class GCloudClient:
         instances = []
         for zone_key, scoped_list in self.instance_client.aggregated_list(request=request):
             for instance in getattr(scoped_list, 'instances', None) or []:
-                if not str(instance.name).startswith(INSTANCE_NAME_PREFIX):
+                if not str(instance.name).startswith(name_prefix):
                     continue
                 zone = str(getattr(instance, 'zone', '') or '').rstrip('/').split('/')[-1] or str(zone_key).split('/')[-1]
                 created_at = None
@@ -469,16 +472,11 @@ class GCloudClient:
         Raises:
             Exception: if the aggregated list call itself fails.
         """
-        # https://docs.cloud.google.com/compute/docs/reference/rest/v1/instances/aggregatedList
-        request = compute_v1.AggregatedListInstancesRequest(
-            project=self.project_id,
-            filter=f'name = "{instance_name}"',
-        )
-        for zone_key, scoped_list in self.instance_client.aggregated_list(request=request):
-            for instance in getattr(scoped_list, 'instances', None) or []:
-                if instance.name == instance_name:
-                    zone = str(getattr(instance, 'zone', '') or '').rstrip('/').split('/')[-1]
-                    return zone or str(zone_key).split('/')[-1]
+        # Same unfiltered aggregatedList as list_runner_instances, matched client-side: a server-side
+        # filter that silently matched nothing would turn every delete into a no-op.
+        for instance in self.list_runner_instances(name_prefix=instance_name):
+            if instance['name'] == instance_name:
+                return instance['zone']
         return None
 
     def delete_runner_instance(self, instance_name, delivery_id=None, zone=None):

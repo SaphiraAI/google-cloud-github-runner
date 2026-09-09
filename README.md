@@ -245,6 +245,7 @@ Every decision is logged with job id, VM name, zone and reason. `POST /reconcile
 | `RECONCILE_AUDIENCE`      | OIDC audience expected on `/reconcile` calls | No (route disabled when unset)            |
 | `RECONCILE_STUCK_MINUTES` | Age after which the reconciler creates or deletes | No (default: `10`)                   |
 | `RECONCILE_MAX_CREATES`   | Max. VMs one reconcile pass creates | No (default: `20`)                                |
+| `RECONCILE_REPOSITORIES`  | Comma-separated `owner/repo` list to restrict the scan | No (default: every installed repo)  |
 | `PORT`                    | Web server port                | No (default: `8080`)                       |
 | `SETUP_USERNAME`          | Setup authentication username  | No (default: `cloud`)                      |
 | `SETUP_PASSWORD`          | Setup authentication password  | No (default: `GOOGLE_CLOUD_PROJECT`)       |
