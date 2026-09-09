@@ -1,14 +1,80 @@
 """
 Google Cloud Client for managing GCE instances.
 """
+import concurrent.futures
 import logging
 import os
 import re
 import uuid
 import shlex
 import google.cloud.compute_v1 as compute_v1
+from google.api_core import exceptions as gapi_exceptions
 
 logger = logging.getLogger(__name__)
+
+# How long to wait for an instances.insert operation before giving up (seconds).
+DEFAULT_INSERT_TIMEOUT_SECONDS = 120
+
+# Operation error codes that mean "this zone cannot serve the request right now".
+# https://cloud.google.com/compute/docs/troubleshooting/troubleshooting-vm-creation
+RETRY_ELSEWHERE_CODE_PREFIXES = (
+    'ZONE_RESOURCE_POOL_EXHAUSTED',
+    'QUOTA_EXCEEDED',
+)
+# Message fragments that indicate a stockout even when the code is generic.
+RETRY_ELSEWHERE_MESSAGE_MARKERS = (
+    'stockout',
+    'does not have enough resources',
+    'currently unavailable',
+)
+
+
+class InstanceCreationError(Exception):
+    """The instances.insert operation did not succeed. Never swallowed."""
+
+
+class ZoneCapacityError(InstanceCreationError):
+    """The insert failed for a capacity reason (stockout/quota); another zone may work."""
+
+    def __init__(self, message, code=None, zone=None):
+        super().__init__(message)
+        self.code = code
+        self.zone = zone
+
+
+def classify_operation_errors(errors):
+    """
+    Classify the ``error.errors`` list of a finished Compute operation.
+
+    Args:
+        errors: iterable of compute_v1.Errors (or anything with .code/.message/.error_details).
+
+    Returns:
+        tuple(bool, str): (retry_elsewhere, human readable summary "CODE: message; ...").
+    """
+    retry_elsewhere = False
+    parts = []
+    for error in errors or []:
+        code = str(getattr(error, 'code', '') or '')
+        message = str(getattr(error, 'message', '') or '')
+        reason = ''
+        zone = ''
+        for detail in getattr(error, 'error_details', None) or []:
+            error_info = getattr(detail, 'error_info', None)
+            if error_info is not None:
+                reason = reason or str(getattr(error_info, 'reason', '') or '')
+                metadatas = getattr(error_info, 'metadatas', None) or {}
+                zone = zone or str(metadatas.get('zone', '') if hasattr(metadatas, 'get') else '')
+        summary = f"{code}: {message}"
+        if reason:
+            summary += f" (reason={reason}"
+            summary += f", zone={zone})" if zone else ")"
+        parts.append(summary)
+        haystack = f"{message} {reason}".lower()
+        if code.startswith(RETRY_ELSEWHERE_CODE_PREFIXES) or reason.lower() == 'stockout' \
+                or any(marker in haystack for marker in RETRY_ELSEWHERE_MESSAGE_MARKERS):
+            retry_elsewhere = True
+    return retry_elsewhere, '; '.join(parts)
 
 
 class GCloudClient:
@@ -20,6 +86,7 @@ class GCloudClient:
         self.zone = os.environ.get('GOOGLE_CLOUD_ZONE', 'us-central1-a')
         self.github_runner_group = os.environ.get('GITHUB_RUNNER_GROUP', '').strip()
         self.region = '-'.join(self.zone.split('-')[:-1])
+        self.insert_timeout = int(os.environ.get('GCE_INSERT_TIMEOUT_SECONDS', DEFAULT_INSERT_TIMEOUT_SECONDS))
 
         if not self.project_id:
             logger.warning("GOOGLE_CLOUD_PROJECT not set. GCloudClient will not work correctly.")
@@ -163,12 +230,94 @@ class GCloudClient:
                 operation.name,
                 delivery_id,
             )
-            return instance_name
         except Exception as e:
             logger.error(
                 "Failed to create instance: %s, delivery_id: %s", e, delivery_id
             )
             raise
+
+        # Wait for the operation: capacity errors (stockout, quota) are operation-level
+        # errors, so returning here would report success for a VM that never existed.
+        self._wait_for_insert(operation, instance_name, self.zone, delivery_id=delivery_id)
+        logger.info(
+            "Instance %s created in zone %s, delivery_id: %s",
+            instance_name,
+            self.zone,
+            delivery_id,
+        )
+        return instance_name
+
+    def _wait_for_insert(self, operation, instance_name, zone, delivery_id=None):
+        """
+        Block until the insert operation finishes and raise if it did not succeed.
+
+        Raises:
+            ZoneCapacityError: the zone is out of capacity/quota; another zone may work.
+            InstanceCreationError: any other failure, including a timed-out wait.
+        """
+        try:
+            operation.result(timeout=self.insert_timeout)
+        except concurrent.futures.TimeoutError:
+            # The operation may still complete; do NOT retry elsewhere or we could double-provision.
+            message = (
+                f"Instance creation for {instance_name} in zone {zone} timed out after "
+                f"{self.insert_timeout}s (operation {getattr(operation, 'name', '?')}); not retrying"
+            )
+            logger.error("%s, delivery_id: %s", message, delivery_id)
+            raise InstanceCreationError(message)
+        except gapi_exceptions.GoogleAPICallError as e:
+            errors = self._operation_errors(operation)
+            retry_elsewhere, summary = classify_operation_errors(errors)
+            if not summary:
+                summary = str(e)
+            code = str(getattr(errors[0], 'code', '') or '') if errors else ''
+            if retry_elsewhere:
+                logger.warning(
+                    "Instance creation for %s in zone %s failed with a capacity error: %s, delivery_id: %s",
+                    instance_name,
+                    zone,
+                    summary,
+                    delivery_id,
+                )
+                raise ZoneCapacityError(
+                    f"Zone {zone} has no capacity for {instance_name}: {summary}", code=code, zone=zone
+                ) from e
+            logger.error(
+                "Instance creation for %s in zone %s failed: %s, delivery_id: %s",
+                instance_name,
+                zone,
+                summary,
+                delivery_id,
+            )
+            raise InstanceCreationError(
+                f"Instance creation for {instance_name} in zone {zone} failed: {summary}"
+            ) from e
+
+        # Defensive: a DONE operation that carries errors but did not raise is still a failure.
+        errors = self._operation_errors(operation)
+        if errors:
+            _, summary = classify_operation_errors(errors)
+            logger.error(
+                "Instance creation for %s in zone %s finished with errors: %s, delivery_id: %s",
+                instance_name,
+                zone,
+                summary,
+                delivery_id,
+            )
+            raise InstanceCreationError(
+                f"Instance creation for {instance_name} in zone {zone} finished with errors: {summary}"
+            )
+
+    @staticmethod
+    def _operation_errors(operation):
+        """Return the list of compute_v1.Errors attached to an operation (empty if none)."""
+        try:
+            error = getattr(operation, 'error', None)
+            errors = list(getattr(error, 'errors', None) or [])
+        except Exception:
+            return []
+        # Guard against MagicMock-like objects in tests returning non-Errors items.
+        return [e for e in errors if isinstance(getattr(e, 'code', None), str)]
 
     def delete_runner_instance(self, instance_name, delivery_id=None):
         """
