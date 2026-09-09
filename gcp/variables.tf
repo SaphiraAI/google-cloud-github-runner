@@ -210,15 +210,16 @@ variable "github_runners_alert_stuck_job_seconds" {
   }
 }
 
-# Restrict the reconciler to these repositories (owner/repo); empty scans every repository the App can see
-variable "github_runners_reconcile_repositories" {
-  description = "Repositories (owner/repo) the reconciler scans; empty means every repository of the GitHub App installation"
+# Repositories the reconciler must ignore (owner/repo). There is deliberately no include list:
+# every repository the GitHub App is installed on is covered without configuration.
+variable "github_runners_reconcile_exclude_repositories" {
+  description = "Repositories (owner/repo) the reconciler ignores; every other repository of the GitHub App installation is scanned"
   type        = list(string)
   default     = []
   nullable    = false
 
   validation {
-    condition     = alltrue([for repo in var.github_runners_reconcile_repositories : can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo))])
+    condition     = alltrue([for repo in var.github_runners_reconcile_exclude_repositories : can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo))])
     error_message = "Repositories must be given as owner/repo."
   }
 }

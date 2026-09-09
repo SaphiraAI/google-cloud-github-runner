@@ -185,3 +185,35 @@ class TestRateLimitVisibility:
         with caplog.at_level('WARNING', logger='app.clients.github_client'):
             client.list_runners(org_name='example-org', token='tok')
         assert any('rate limit is low' in r.message and '42' in r.message for r in caplog.records)
+
+
+class TestInstallationRepositoryEnumeration:
+    @patch('app.clients.github_client.requests')
+    def test_pagination_is_complete_for_101_repositories(self, mock_requests, client):
+        """Positive control: two pages (100 + 1) yield all 101 repositories."""
+        page2 = 'https://api.github.com/installation/repositories?per_page=100&page=2'
+
+        def repo(i):
+            return {'full_name': f'example-org/repo-{i}', 'html_url': f'https://github.com/example-org/repo-{i}',
+                    'owner': {'login': 'example-org', 'type': 'Organization', 'html_url': 'https://github.com/example-org'}}
+
+        def fake_get(url, headers=None, params=None, timeout=None):
+            if url == 'https://api.github.com/installation/repositories':
+                return _response({'total_count': 101, 'repositories': [repo(i) for i in range(100)]}, next_url=page2)
+            if url == page2:
+                return _response({'total_count': 101, 'repositories': [repo(100)]})
+            raise AssertionError(url)
+
+        mock_requests.get.side_effect = fake_get
+        repos = client.list_installation_repositories(token='tok')
+        assert len(repos) == 101
+        assert repos[-1]['full_name'] == 'example-org/repo-100'
+        assert len({r['full_name'] for r in repos}) == 101
+
+    @patch('app.clients.github_client.requests')
+    def test_hitting_the_page_cap_is_logged(self, mock_requests, client, caplog):
+        mock_requests.get.return_value = _response({'repositories': [{'full_name': 'a/b', 'owner': {}}]},
+                                                   next_url='https://api.github.com/installation/repositories?page=2')
+        with caplog.at_level('WARNING', logger='app.clients.github_client'):
+            client._get_paginated('https://api.github.com/installation/repositories', 'tok', 'repositories', max_pages=1)
+        assert any('incomplete' in r.message for r in caplog.records)

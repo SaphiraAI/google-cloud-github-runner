@@ -33,13 +33,13 @@ module "cloud_run_github_runners_manager" {
         GOOGLE_CLOUD_ZONE    = "${var.region}-${var.zone}"
         GITHUB_RUNNER_GROUP  = var.github_runner_group
         # Reconciler (POST /reconcile) is only accepted from this caller with this audience
-        RECONCILE_INVOKER_EMAIL      = module.service-account-github-runners-reconciler.email
-        RECONCILE_AUDIENCE           = local.github_runners_manager_audience
-        RECONCILE_STUCK_MINUTES      = tostring(var.github_runners_reconcile_stuck_minutes)
-        RECONCILE_REPOSITORIES       = join(",", var.github_runners_reconcile_repositories)
-        RECONCILE_SLOW_RETRY_HOURS   = tostring(var.github_runners_reconcile_slow_retry_hours)
-        RECONCILE_SLOW_RETRY_MINUTES = tostring(var.github_runners_reconcile_slow_retry_minutes)
-        RECONCILE_INTERVAL_MINUTES   = tostring(local.github_runners_reconcile_interval_minutes)
+        RECONCILE_INVOKER_EMAIL        = module.service-account-github-runners-reconciler.email
+        RECONCILE_AUDIENCE             = local.github_runners_manager_audience
+        RECONCILE_STUCK_MINUTES        = tostring(var.github_runners_reconcile_stuck_minutes)
+        RECONCILE_EXCLUDE_REPOSITORIES = join(",", var.github_runners_reconcile_exclude_repositories)
+        RECONCILE_SLOW_RETRY_HOURS     = tostring(var.github_runners_reconcile_slow_retry_hours)
+        RECONCILE_SLOW_RETRY_MINUTES   = tostring(var.github_runners_reconcile_slow_retry_minutes)
+        RECONCILE_INTERVAL_MINUTES     = tostring(local.github_runners_reconcile_interval_minutes)
         # Webhook -> Cloud Tasks -> POST /tasks/provision (only this caller, with MANAGER_URL as audience)
         PROVISION_QUEUE         = google_cloud_tasks_queue.github-runners-provision.id
         PROVISION_INVOKER_EMAIL = module.service-account-github-runners-provisioner.email

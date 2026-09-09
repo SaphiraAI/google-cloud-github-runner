@@ -443,26 +443,52 @@ class TestHelpers:
         assert service.max_creates == 20
 
 
-class TestRepositoryFilter:
-    def test_all_installed_repositories_by_default(self):
+class TestRepositoryCoverage:
+    def test_every_installed_repository_is_scanned_without_configuration(self):
         github = FakeGitHub(repos=[ORG_REPO, USER_REPO], jobs={})
         report, _ = run_pass(github, FakeGCloud([]))
         assert report['repositories'] == ['example-org/example-repo', 'octocat/hello']
 
-    def test_filter_restricts_scan_case_insensitively(self, caplog):
+    def test_queued_job_in_a_second_repository_is_provisioned(self):
+        second = {**ORG_REPO, 'full_name': 'example-org/second', 'html_url': 'https://github.com/example-org/second'}
+        github = FakeGitHub(repos=[ORG_REPO, second],
+                            jobs={ORG_REPO['full_name']: [], 'example-org/second': [job(7, 'queued', age_minutes=15)]})
+        report, provisioner = run_pass(github, FakeGCloud([]))
+        assert [c['repo_name'] for c in provisioner.calls] == ['example-org/second']
+        assert report['created'][0]['repo'] == 'example-org/second'
+
+    def test_exclude_list_drops_named_repositories_only(self, monkeypatch):
+        monkeypatch.setenv('RECONCILE_EXCLUDE_REPOSITORIES', 'OCTOCAT/hello, other/thing')
         github = FakeGitHub(repos=[ORG_REPO, USER_REPO],
                             jobs={USER_REPO['full_name']: [job(1, 'queued', age_minutes=15)]})
-        with caplog.at_level('WARNING', logger='app.services.reconcile_service'):
-            report, provisioner = run_pass(github, FakeGCloud([]), repositories='example-org/example-repo, Other/Repo')
+        service = ReconcileService(github_client=github, gcloud_client=FakeGCloud(), webhook_service=FakeProvisioner(),
+                                   now=NOW)
+        report = service.run()
         assert report['repositories'] == ['example-org/example-repo']
-        assert provisioner.calls == [], 'jobs of unselected repositories are not provisioned'
-        assert any('other/repo' in r.message for r in caplog.records)
+        assert service.webhook_service.calls == []
 
-    def test_filter_from_environment(self, monkeypatch):
+    def test_include_list_no_longer_exists(self, monkeypatch):
         monkeypatch.setenv('RECONCILE_REPOSITORIES', 'octocat/hello')
-        service = ReconcileService(github_client=FakeGitHub(repos=[ORG_REPO, USER_REPO]), gcloud_client=FakeGCloud(),
-                                   webhook_service=FakeProvisioner(), now=NOW)
-        assert service.run()['repositories'] == ['octocat/hello']
+        github = FakeGitHub(repos=[ORG_REPO, USER_REPO], jobs={})
+        report, _ = run_pass(github, FakeGCloud([]))
+        assert report['repositories'] == ['example-org/example-repo', 'octocat/hello'], 'the old include list is ignored'
+
+    def test_creation_budget_is_shared_round_robin_across_repositories(self):
+        """A 100-job fan-out in one repository must not starve a single job in another."""
+        fanout = {**ORG_REPO, 'full_name': 'example-org/fanout', 'html_url': 'https://github.com/example-org/fanout'}
+        quiet = {**ORG_REPO, 'full_name': 'example-org/quiet', 'html_url': 'https://github.com/example-org/quiet'}
+        github = FakeGitHub(repos=[fanout, quiet], jobs={
+            'example-org/fanout': [job(100 + i, 'queued', age_minutes=30) for i in range(30)],
+            'example-org/quiet': [job(1, 'queued', age_minutes=12)],   # younger than every fan-out job
+        })
+        provisioner = FakeProvisioner()
+        service = ReconcileService(github_client=github, gcloud_client=FakeGCloud([]), webhook_service=provisioner,
+                                   stuck_minutes=10, max_creates=10, create_workers=1, now=NOW)
+        report = service.run()
+        created = [c['repo_name'] for c in provisioner.calls]
+        assert created.count('example-org/quiet') == 1
+        assert created.count('example-org/fanout') == 9
+        assert len([s for s in report['skipped'] if 'deferred' in s['reason']]) == 21
 
 
 class TestLabelMatching:

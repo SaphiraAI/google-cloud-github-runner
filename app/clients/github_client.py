@@ -10,6 +10,7 @@ import logging
 
 REQUEST_TIMEOUT = 30  # seconds
 MAX_PAGES = 20  # safety cap for paginated GitHub list endpoints (100 items per page)
+MAX_REPOSITORY_PAGES = 100  # installation repositories: the reconciler must see every one (10,000 repos)
 READ_RETRIES = 3  # attempts for read-only GitHub calls that answer 5xx (GitHub returns sporadic 502s)
 READ_RETRY_BACKOFF = 1.0  # seconds, doubled per attempt
 RUN_LOOKBACK_HOURS = 25  # only runs created within this window can still hold queued jobs
@@ -160,6 +161,8 @@ class GitHubClient:
             next_link = response.links.get('next', {}).get('url')
             url = next_link
             params = None  # the next link already carries the query string
+        if url:
+            logger.warning("Stopped paginating %s after %d pages; results are incomplete", url, max_pages)
         return items
 
     def list_installation_repositories(self, token=None):
@@ -171,7 +174,8 @@ class GitHubClient:
         """
         # https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-app-installation
         token = token or self.get_installation_access_token()
-        repos = self._get_paginated('https://api.github.com/installation/repositories', token, 'repositories')
+        repos = self._get_paginated('https://api.github.com/installation/repositories', token, 'repositories',
+                                    max_pages=MAX_REPOSITORY_PAGES)
         return [
             {
                 'full_name': repo.get('full_name'),

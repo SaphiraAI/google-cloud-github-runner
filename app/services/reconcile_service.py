@@ -96,7 +96,7 @@ class ReconcileService:
         max_creates=None,
         create_workers=None,
         now=None,
-        repositories=None,
+        exclude_repositories=None,
         slow_retry_hours=None,
     ):
         self.github_client = github_client or GitHubClient()
@@ -110,7 +110,8 @@ class ReconcileService:
             else _env_int('RECONCILE_MAX_CREATES', DEFAULT_MAX_CREATES)
         self.create_workers = create_workers if create_workers is not None \
             else _env_int('RECONCILE_CREATE_WORKERS', DEFAULT_CREATE_WORKERS)
-        self.repositories_filter = os.environ.get('RECONCILE_REPOSITORIES', '') if repositories is None else repositories
+        self.exclude_repositories = os.environ.get('RECONCILE_EXCLUDE_REPOSITORIES', '') \
+            if exclude_repositories is None else exclude_repositories
         self.slow_retry_hours = slow_retry_hours if slow_retry_hours is not None \
             else _env_int('RECONCILE_SLOW_RETRY_HOURS', DEFAULT_SLOW_RETRY_HOURS)
         self.slow_retry_minutes = max(1, _env_int('RECONCILE_SLOW_RETRY_MINUTES', DEFAULT_SLOW_RETRY_MINUTES))
@@ -132,15 +133,18 @@ class ReconcileService:
         return self.now() - timestamp >= datetime.timedelta(minutes=self.stuck_minutes)
 
     def _select_repositories(self, repos):
-        """Restrict the scan to RECONCILE_REPOSITORIES (comma-separated full names) when set."""
-        wanted = {name.strip().lower() for name in self.repositories_filter.split(',') if name.strip()}
-        if not wanted:
+        """
+        Every repository the App installation can see, minus RECONCILE_EXCLUDE_REPOSITORIES
+        (comma-separated owner/repo). There is deliberately no include list: a repository the
+        App is installed on is covered without configuration.
+        """
+        excluded = {name.strip().lower() for name in self.exclude_repositories.split(',') if name.strip()}
+        if not excluded:
             return repos
-        selected = [repo for repo in repos if (repo.get('full_name') or '').lower() in wanted]
-        missing = wanted - {(repo.get('full_name') or '').lower() for repo in selected}
-        if missing:
-            logger.warning("Reconcile %s: RECONCILE_REPOSITORIES names repositories the App cannot see: %s",
-                           self.run_id, ', '.join(sorted(missing)))
+        selected = [repo for repo in repos if (repo.get('full_name') or '').lower() not in excluded]
+        dropped = [repo.get('full_name') for repo in repos if repo not in selected]
+        if dropped:
+            logger.info("Reconcile %s: excluding %s by configuration", self.run_id, ', '.join(dropped))
         return selected
 
     @staticmethod
@@ -462,7 +466,7 @@ class ReconcileService:
                 report['skipped'].append({**entry, 'reason': f"no matching instance template for label {label}"})
                 continue
             candidates.append((created_at, repo, job))
-        candidates.sort(key=lambda item: item[0])
+        candidates = self._share_budget(candidates)
         for _, repo, job in candidates[self.max_creates:]:
             logger.warning("Reconcile %s: job %s (%s) deferred to the next pass (more than %d creations)",
                            self.run_id, job.get('id'), repo.get('full_name'), self.max_creates)
@@ -499,6 +503,27 @@ class ReconcileService:
                                self.run_id, instance_name, job.get('id'), repo.get('full_name'), job.get('name'),
                                job.get('created_at'))
                 report['created'].append({**entry, 'vm': instance_name})
+
+    @staticmethod
+    def _share_budget(candidates):
+        """
+        Order candidates round-robin across repositories, oldest job first within each repository
+        and repositories ordered by their oldest job, so one repository's fan-out cannot consume the
+        whole per-pass budget while another repository's single job waits.
+        """
+        by_repo = {}
+        for created_at, repo, job in sorted(candidates, key=lambda item: item[0]):
+            by_repo.setdefault(repo.get('full_name'), []).append((created_at, repo, job))
+        queues = list(by_repo.values())  # insertion order = by oldest job
+        ordered = []
+        while queues:
+            remaining = []
+            for queue in queues:
+                ordered.append(queue.pop(0))
+                if queue:
+                    remaining.append(queue)
+            queues = remaining
+        return ordered
 
     def _provision(self, repo, job):
         owner = repo.get('owner') or {}
