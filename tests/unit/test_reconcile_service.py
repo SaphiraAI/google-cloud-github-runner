@@ -6,6 +6,7 @@ what the pass creates, deletes, keeps or skips. Both directions are covered: the
 must create when it should and must never delete a VM that is running a job.
 """
 import datetime
+import json
 
 import pytest
 
@@ -539,9 +540,48 @@ class TestReviewFindings:
         assert gcloud.deleted == []
         assert any('could not re-list runners' in r for r in reasons(report, 'skipped'))
 
-    def test_jobs_queued_longer_than_give_up_hours_are_not_retried(self):
+    def test_old_queued_jobs_are_retried_at_a_reduced_rate_never_dropped(self, caplog):
+        """Review: giving up is a silent drop. Old jobs keep being retried, once per slow interval."""
+        # 7 h queued = 420 min; 420 % 60 = 0 -> due now. 7 h 20 min -> not due. 15 min -> normal path.
         github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=7 * 60),
-                                                          job(2, 'queued', age_minutes=15)]})
-        report, provisioner = run_pass(github, FakeGCloud([]))
-        assert [c['job_id'] for c in provisioner.calls] == [2]
-        assert any('more than 6 hours' in r for r in reasons(report, 'skipped'))
+                                                          job(2, 'queued', age_minutes=7 * 60 + 20),
+                                                          job(3, 'queued', age_minutes=15)]})
+        with caplog.at_level('WARNING', logger='app.services.reconcile_service'):
+            report, provisioner = run_pass(github, FakeGCloud([]))
+        assert sorted(c['job_id'] for c in provisioner.calls) == [1, 3]
+        assert any('retried at most every 60 min' in r for r in reasons(report, 'skipped'))
+        stuck = [r for r in caplog.records if 'queued for 7 h with no runner' in r.message]
+        assert len(stuck) == 2, 'every stuck job is called out loudly on every pass'
+        assert not any('giving up' in r.message for r in caplog.records)
+        assert report['oldest_queued_job_age_seconds'] == (7 * 60 + 20) * 60
+
+
+class TestHeartbeat:
+    def test_every_completed_pass_emits_a_structured_heartbeat(self, capsys):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=42)]})
+        report, _ = run_pass(github, FakeGCloud([vm('gcp-runner-1', age_minutes=1, job_id=1)]))
+        lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{')]
+        beats = [entry for entry in lines if entry.get('event') == 'reconcile_heartbeat']
+        assert len(beats) == 1
+        beat = beats[0]
+        assert beat['message'].startswith('RECONCILE_HEARTBEAT run_id=')
+        assert beat['run_id'] == report['run_id']
+        assert beat['queued_jobs'] == 1 and beat['live_vms'] == 1
+        assert beat['oldest_queued_job_age_seconds'] == 42 * 60
+        assert beat['severity'] == 'INFO' and beat['dry_run'] is False
+
+    def test_no_queued_jobs_reports_zero_age(self, capsys):
+        report, _ = run_pass(FakeGitHub(jobs={}), FakeGCloud([]))
+        assert report['oldest_queued_job_age_seconds'] == 0
+        beat = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{')][-1]
+        assert beat['oldest_queued_job_age_seconds'] == 0
+
+    def test_a_failed_pass_emits_no_heartbeat(self, capsys):
+        class BrokenGitHub(FakeGitHub):
+            def get_installation_access_token(self):
+                raise RuntimeError('GitHub App auth failed')
+        service = ReconcileService(github_client=BrokenGitHub(), gcloud_client=FakeGCloud(),
+                                   webhook_service=FakeProvisioner(), now=NOW)
+        with pytest.raises(RuntimeError):
+            service.run()
+        assert 'reconcile_heartbeat' not in capsys.readouterr().out

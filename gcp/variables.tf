@@ -157,15 +157,26 @@ variable "github_runners_reconcile_stuck_minutes" {
   }
 }
 
-# Stop re-provisioning a job that has been queued this long (a template whose runner never registers would churn)
-variable "github_runners_reconcile_give_up_hours" {
-  description = "Hours after which the reconciler stops creating VMs for a still-queued job"
+# After this many hours queued, a job is retried at a reduced rate (never dropped)
+variable "github_runners_reconcile_slow_retry_hours" {
+  description = "Hours after which the reconciler retries a still-queued job only every slow-retry interval instead of every pass"
   type        = number
   default     = 6
 
   validation {
-    condition     = var.github_runners_reconcile_give_up_hours >= 1 && var.github_runners_reconcile_give_up_hours <= 24
-    error_message = "Give-up hours must be between 1 and 24 (GitHub cancels queued jobs after 24 h)."
+    condition     = var.github_runners_reconcile_slow_retry_hours >= 1 && var.github_runners_reconcile_slow_retry_hours <= 24
+    error_message = "Slow-retry hours must be between 1 and 24 (GitHub cancels queued jobs after 24 h)."
+  }
+}
+
+variable "github_runners_reconcile_slow_retry_minutes" {
+  description = "Interval in minutes between provisioning attempts for jobs queued longer than the slow-retry hours"
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.github_runners_reconcile_slow_retry_minutes >= 5 && var.github_runners_reconcile_slow_retry_minutes <= 1440
+    error_message = "Slow-retry minutes must be between 5 and 1440."
   }
 }
 

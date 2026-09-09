@@ -240,6 +240,10 @@ Cloud Scheduler therefore calls `POST /reconcile` every few minutes (OIDC-authen
 *   never deletes a VM that GitHub reports as running a job (by runner name or busy flag).
 
 Every decision is logged with job id, VM name, zone and reason. `POST /reconcile?dry_run=1` reports without acting.
+The reconciler never gives up on a queued job: after `RECONCILE_SLOW_RETRY_HOURS` it retries at most every
+`RECONCILE_SLOW_RETRY_MINUTES` and logs a WARNING per pass (GitHub's 24-hour queued-job timeout is the only floor).
+Every completed pass writes a structured heartbeat line (`event=reconcile_heartbeat`, marker `RECONCILE_HEARTBEAT`)
+carrying `oldest_queued_job_age_seconds`; the monitoring alerts in `gcp/monitoring.tf` read it.
 
 ## 🔐 Environment Variables
 
@@ -259,7 +263,9 @@ Every decision is logged with job id, VM name, zone and reason. `POST /reconcile
 | `RECONCILE_STUCK_MINUTES` | Age after which the reconciler creates or deletes | No (default: `10`)                   |
 | `RECONCILE_MAX_CREATES`   | Max. VMs one reconcile pass creates | No (default: `20`)                                |
 | `RECONCILE_REPOSITORIES`  | Comma-separated `owner/repo` list to restrict the scan | No (default: every installed repo)  |
-| `RECONCILE_GIVE_UP_HOURS` | Stop re-provisioning a job queued longer than this | No (default: `6`)                     |
+| `RECONCILE_SLOW_RETRY_HOURS` | Jobs queued longer than this are retried at a reduced rate (never dropped) | No (default: `6`) |
+| `RECONCILE_SLOW_RETRY_MINUTES` | Interval between attempts for such jobs | No (default: `60`)                         |
+| `RECONCILE_INTERVAL_MINUTES` | Minutes between passes (matches the scheduler) | No (default: `5`)                      |
 | `MANAGER_URL`             | Public URL of this service; OIDC audience for `/tasks/provision` | No (route disabled when unset) |
 | `PROVISION_QUEUE`         | Cloud Tasks queue path (`projects/../locations/../queues/..`) for webhook hand-off | No (inline creation when unset) |
 | `PROVISION_INVOKER_EMAIL` | Service account Cloud Tasks uses to call `/tasks/provision` | No (route disabled when unset)      |

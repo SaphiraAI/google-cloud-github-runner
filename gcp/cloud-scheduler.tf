@@ -9,6 +9,9 @@ locals {
   # have to reference its own generated URL (which would be a dependency cycle).
   # https://cloud.google.com/run/docs/triggering/https-request#deterministic
   github_runners_manager_audience = "https://${local.github_runners_manager_name}-${module.project.number}.${var.region}.run.app"
+  # Minutes between passes, read from a "*/N * * * *" schedule (5 when the schedule has another shape);
+  # the reconciler uses it to gate reduced-rate retries of long-queued jobs.
+  github_runners_reconcile_interval_minutes = can(regex("^\\*/(\\d+) \\* \\* \\* \\*$", var.github_runners_reconcile_schedule)) ? tonumber(regex("^\\*/(\\d+) \\* \\* \\* \\*$", var.github_runners_reconcile_schedule)[0]) : 5
 }
 
 # Service Account Cloud Scheduler uses to mint the OIDC token for the reconcile call

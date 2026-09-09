@@ -16,6 +16,7 @@ Every decision is logged with the job id, VM name, zone and reason, and returned
 """
 import concurrent.futures
 import datetime
+import json
 import logging
 import os
 import uuid
@@ -29,12 +30,30 @@ logger = logging.getLogger(__name__)
 DEFAULT_STUCK_MINUTES = 10
 DEFAULT_MAX_CREATES = 20
 DEFAULT_CREATE_WORKERS = 4
-# A job queued longer than this is no longer re-provisioned (a template whose runner never
-# registers would otherwise churn a VM every pass until GitHub cancels the job after 24 h).
-DEFAULT_GIVE_UP_HOURS = 6
+# A job queued longer than this is retried at a reduced rate (once per RECONCILE_SLOW_RETRY_MINUTES)
+# instead of every pass, so a template whose runner never registers does not churn a VM every
+# five minutes. It is never given up on: GitHub's own 24 h queued-job timeout is the only floor.
+DEFAULT_SLOW_RETRY_HOURS = 6
+DEFAULT_SLOW_RETRY_MINUTES = 60
+# How often the pass runs (must match the Cloud Scheduler schedule); used to gate slow retries.
+DEFAULT_INTERVAL_MINUTES = 5
+# Stable marker for the heartbeat log line the monitoring alert reads.
+HEARTBEAT_EVENT = 'reconcile_heartbeat'
+HEARTBEAT_MARKER = 'RECONCILE_HEARTBEAT'
+STUCK_JOB_EVENT = 'reconcile_stuck_job'
 # Suffix for VMs the reconciler creates, so a late webhook for the same job never races on
 # the same instance name in a different zone; both VMs carry the same gha-job-id label.
 RECONCILE_NAME_SUFFIX = '-r'
+
+
+def emit_structured(event, message, **fields):
+    """
+    Write one JSON line to stdout. Cloud Run turns JSON stdout lines into structured log entries
+    (jsonPayload), which log-based metrics and alerts can read; the plain logger line stays too.
+    """
+    record = {'severity': 'INFO', 'message': message, 'event': event, **fields}
+    print(json.dumps(record, default=str), flush=True)
+    logger.info("%s", message)
 
 
 def _env_int(name, default):
@@ -76,7 +95,7 @@ class ReconcileService:
         create_workers=None,
         now=None,
         repositories=None,
-        give_up_hours=None,
+        slow_retry_hours=None,
     ):
         self.github_client = github_client or GitHubClient()
         self.gcloud_client = gcloud_client or GCloudClient()
@@ -90,8 +109,10 @@ class ReconcileService:
         self.create_workers = create_workers if create_workers is not None \
             else _env_int('RECONCILE_CREATE_WORKERS', DEFAULT_CREATE_WORKERS)
         self.repositories_filter = os.environ.get('RECONCILE_REPOSITORIES', '') if repositories is None else repositories
-        self.give_up_hours = give_up_hours if give_up_hours is not None \
-            else _env_int('RECONCILE_GIVE_UP_HOURS', DEFAULT_GIVE_UP_HOURS)
+        self.slow_retry_hours = slow_retry_hours if slow_retry_hours is not None \
+            else _env_int('RECONCILE_SLOW_RETRY_HOURS', DEFAULT_SLOW_RETRY_HOURS)
+        self.slow_retry_minutes = max(1, _env_int('RECONCILE_SLOW_RETRY_MINUTES', DEFAULT_SLOW_RETRY_MINUTES))
+        self.interval_minutes = max(1, _env_int('RECONCILE_INTERVAL_MINUTES', DEFAULT_INTERVAL_MINUTES))
         self._now = now
         self.run_id = f"reconcile-{uuid.uuid4().hex[:8]}"
 
@@ -160,6 +181,7 @@ class ReconcileService:
             'stuck_minutes': self.stuck_minutes,
             'repositories': [],
             'queued_jobs': 0,
+            'oldest_queued_job_age_seconds': 0,
             'live_vms': 0,
             'deleted': [],
             'created': [],
@@ -196,6 +218,9 @@ class ReconcileService:
                 elif status == 'queued' and template_label_for(job.get('labels')):
                     queued_jobs.append((repo, job))
         report['queued_jobs'] = len(queued_jobs)
+        ages = [self.now() - parse_github_time(job.get('created_at')) for _, job in queued_jobs
+                if parse_github_time(job.get('created_at')) is not None]
+        report['oldest_queued_job_age_seconds'] = int(max(ages).total_seconds()) if ages else 0
 
         # --- Compute view ---------------------------------------------------------------
         vms = self.gcloud_client.list_runner_instances()
@@ -248,6 +273,22 @@ class ReconcileService:
             "%d skipped, %d error(s)",
             self.run_id, report['queued_jobs'], report['live_vms'], len(report['deleted']),
             len(report['created']), len(report['kept']), len(report['skipped']), len(report['errors']),
+        )
+        # Heartbeat: one structured line per completed pass; the monitoring alerts read it
+        # (absence = reconciler down, oldest_queued_job_age_seconds = stuck jobs).
+        emit_structured(
+            HEARTBEAT_EVENT,
+            f"{HEARTBEAT_MARKER} run_id={self.run_id} queued_jobs={report['queued_jobs']} "
+            f"oldest_queued_job_age_seconds={report['oldest_queued_job_age_seconds']} live_vms={report['live_vms']} "
+            f"created={len(report['created'])} deleted={len(report['deleted'])} errors={len(report['errors'])}",
+            run_id=self.run_id,
+            dry_run=dry_run,
+            queued_jobs=report['queued_jobs'],
+            oldest_queued_job_age_seconds=report['oldest_queued_job_age_seconds'],
+            live_vms=report['live_vms'],
+            created=len(report['created']),
+            deleted=len(report['deleted']),
+            errors=len(report['errors']),
         )
         return report
 
@@ -384,12 +425,25 @@ class ReconcileService:
                 continue
             if not self._is_stuck(created_at):
                 continue
-            if created_at is not None and self.now() - created_at >= datetime.timedelta(hours=self.give_up_hours):
-                logger.warning("Reconcile %s: job %s (%s, %s) has been queued since %s; giving up on it after %d h",
-                               self.run_id, job_id, repo.get('full_name'), job.get('name'), created_at,
-                               self.give_up_hours)
-                report['skipped'].append({**entry, 'reason': f"queued for more than {self.give_up_hours} hours; not retried"})
-                continue
+            if created_at is not None and self.now() - created_at >= datetime.timedelta(hours=self.slow_retry_hours):
+                # Never give up: keep trying, but once per slow interval instead of every pass, and say so loudly.
+                age_minutes = int((self.now() - created_at).total_seconds() // 60)
+                due = age_minutes % self.slow_retry_minutes < self.interval_minutes
+                logger.warning(
+                    "Reconcile %s: job %s (%s, %s) has been queued for %d h with no runner; %s",
+                    self.run_id, job_id, repo.get('full_name'), job.get('name'), age_minutes // 60,
+                    "retrying now" if due else
+                    f"retrying at most every {self.slow_retry_minutes} min (next in about "
+                    f"{self.slow_retry_minutes - age_minutes % self.slow_retry_minutes} min)",
+                )
+                emit_structured(STUCK_JOB_EVENT, f"stuck job {job_id} queued for {age_minutes} min",
+                                run_id=self.run_id, job_id=job_id, repo=repo.get('full_name'),
+                                queued_minutes=age_minutes, retry_now=due)
+                if not due:
+                    reason = (f"queued for more than {self.slow_retry_hours} hours; "
+                              f"retried at most every {self.slow_retry_minutes} min")
+                    report['skipped'].append({**entry, 'reason': reason})
+                    continue
             # Jobs without a template must not consume the per-pass creation budget.
             label = template_label_for(job.get('labels'))
             if label not in provisionable:
