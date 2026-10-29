@@ -7,7 +7,6 @@ from flask import Blueprint, request, jsonify
 from app.clients.gcloud_client import InstanceCreationError, ZoneCapacityError
 from app.services import WebhookService
 from app.utils.security import verify_google_oidc_token
-from app import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +14,6 @@ tasks_bp = Blueprint('tasks', __name__, url_prefix='/tasks')
 
 
 @tasks_bp.route('/provision', methods=['POST'])
-@limiter.exempt
 def provision():
     """Create the VM for the job in the task body. Non-2xx answers make Cloud Tasks retry."""
     claims, reason = verify_google_oidc_token(

@@ -7,7 +7,6 @@ import threading
 from flask import Blueprint, request, jsonify
 from app.services import ReconcileService
 from app.utils.security import verify_google_oidc_token
-from app import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +17,6 @@ _reconcile_lock = threading.Lock()
 
 
 @reconcile_bp.route('/reconcile', methods=['POST'])
-@limiter.exempt
 def reconcile():
     """Run one reconciliation pass. Query ``dry_run=1`` reports decisions without acting."""
     claims, reason = verify_google_oidc_token(
