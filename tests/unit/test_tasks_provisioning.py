@@ -159,6 +159,50 @@ class TestProvisionFromTask:
         assert result['action'] == 'skipped' and result['reason'] == reason
         gcloud.create_runner_instance.assert_not_called()
 
+    @pytest.mark.parametrize('status', ['in_progress', 'completed'])
+    def test_job_that_ran_on_another_jobs_vm_keeps_its_vm(self, status, caplog):
+        """The job used a VM created for another job, so the label is one VM short: create ours."""
+        service, github, gcloud, _ = _service()
+        github.get_workflow_job.return_value = {'status': status, 'runner_name': 'gcp-runner-1111'}
+        with caplog.at_level('INFO', logger='app.services.webhook_service'):
+            result = service.provision_from_task(TASK)
+        assert result['action'] == 'created' and result['runner_name'] == 'gcp-runner-4242'
+        assert gcloud.create_runner_instance.call_args.kwargs['job_id'] == 4242
+        assert any('created for another job' in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize('runner_name', [
+        'gcp-runner-4242', 'gcp-runner-4242-r', 'gcp-runner-4242-r2', 'gcp-runner-dependabot-4242',
+    ])
+    def test_job_on_its_own_vm_is_skipped(self, runner_name):
+        service, github, gcloud, _ = _service()
+        github.get_workflow_job.return_value = {'status': 'in_progress', 'runner_name': runner_name}
+        result = service.provision_from_task(TASK)
+        assert result['action'] == 'skipped' and result['reason'] == 'job is in_progress'
+        gcloud.create_runner_instance.assert_not_called()
+
+    def test_job_id_prefix_of_another_job_is_not_its_own_vm(self):
+        service, github, gcloud, _ = _service()
+        github.get_workflow_job.return_value = {'status': 'in_progress', 'runner_name': 'gcp-runner-42420'}
+        assert service.provision_from_task(TASK)['action'] == 'created'
+
+    def test_job_on_another_jobs_vm_with_its_own_vm_alive_is_skipped(self):
+        """Its own VM already exists and will serve a queued job of the label."""
+        service, github, gcloud, _ = _service()
+        github.get_workflow_job.return_value = {'status': 'in_progress', 'runner_name': 'gcp-runner-1111'}
+        gcloud.list_runner_instances.return_value = [
+            {'name': 'gcp-runner-4242', 'zone': 'us-central1-c', 'status': 'STAGING', 'labels': {'gha-job-id': '4242'}},
+        ]
+        result = service.provision_from_task(TASK)
+        assert result['action'] == 'skipped' and 'already exists' in result['reason']
+        gcloud.create_runner_instance.assert_not_called()
+
+    @pytest.mark.parametrize('runner_name', [None, '', 'GitHub Actions 1000282756'])
+    def test_job_finished_without_one_of_our_runners_is_skipped(self, runner_name):
+        service, github, gcloud, _ = _service()
+        github.get_workflow_job.return_value = {'status': 'completed', 'runner_name': runner_name}
+        assert service.provision_from_task(TASK)['action'] == 'skipped'
+        gcloud.create_runner_instance.assert_not_called()
+
     def test_skips_when_a_live_vm_for_the_job_exists(self):
         service, github, gcloud, _ = _service()
         github.get_workflow_job.return_value = {'status': 'queued'}

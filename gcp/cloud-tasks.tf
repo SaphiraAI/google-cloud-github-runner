@@ -48,7 +48,7 @@ resource "google_cloud_tasks_queue" "github-runners-provision" {
     # Capacity errors answer 503; retry with backoff, then hand off to the reconciler.
     max_attempts  = var.github_runners_provision_max_attempts
     min_backoff   = "30s"
-    max_backoff   = "300s"
+    max_backoff   = "${var.github_runners_provision_max_backoff_seconds}s"
     max_doublings = 4
   }
 

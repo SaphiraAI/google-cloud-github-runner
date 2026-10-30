@@ -4,7 +4,7 @@ Service for processing webhook events.
 import logging
 import re
 from app.clients import GitHubClient, GCloudClient
-from app.clients.gcloud_client import JOB_ID_LABEL, LIVE_INSTANCE_STATUSES
+from app.clients.gcloud_client import INSTANCE_NAME_PREFIX, JOB_ID_LABEL, LIVE_INSTANCE_STATUSES
 from app.clients.tasks_client import TasksClient
 
 logger = logging.getLogger(__name__)
@@ -196,8 +196,11 @@ class WebhookService:
     def provision_from_task(self, payload):
         """Handle one Cloud Tasks provisioning task (idempotent).
 
-        Skips when the job is no longer queued on GitHub or a live VM for the job already exists,
-        otherwise provisions through the same path as the webhook.
+        GitHub gives a queued job to any runner with its label, so a job may start on a VM created
+        for another job. When that happens before this job's own VM exists, the label is one VM
+        short: the task still creates its VM, and GitHub hands it to a job still queued. Skips when
+        the job finished without a runner or ran on its own VM, or when a live VM for the job
+        already exists; otherwise provisions through the same path as the webhook.
 
         Returns:
             dict: {'action': 'created'|'skipped', 'runner_name', 'job_id', 'reason'}.
@@ -223,11 +226,17 @@ class WebhookService:
                 logger.warning("Job %s not found on GitHub when re-checking; provisioning anyway", job_id)
                 job = {'status': 'queued'}
             status = job.get('status')
+            runner_name = job.get('runner_name') or ''
             if status != 'queued':
-                result['reason'] = f"job is {status}"
-                logger.info("Provisioning task for job %s skipped: %s, delivery_id: %s", job_id, result['reason'],
-                            delivery_id)
-                return result
+                if not self._ran_on_another_jobs_vm(runner_name, job_id):
+                    result['reason'] = f"job is {status}"
+                    logger.info("Provisioning task for job %s skipped: %s, delivery_id: %s", job_id, result['reason'],
+                                delivery_id)
+                    return result
+                logger.info(
+                    "Job %s is %s on %s, a VM created for another job; keeping its VM for the label, delivery_id: %s",
+                    job_id, status, runner_name, delivery_id,
+                )
             for vm in self.gcloud_client.list_runner_instances():
                 if vm.get('status') in LIVE_INSTANCE_STATUSES and (vm.get('labels') or {}).get(JOB_ID_LABEL) == str(job_id):
                     result['reason'] = f"VM {vm['name']} already exists in zone {vm['zone']}"
@@ -249,6 +258,14 @@ class WebhookService:
             result['reason'] = 'no matching instance template'
             return result
         return {'action': 'created', 'runner_name': instance_name, 'job_id': job_id, 'reason': ''}
+
+    @staticmethod
+    def _ran_on_another_jobs_vm(runner_name, job_id):
+        """True when ``runner_name`` is one of our VMs and not one created for ``job_id`` (or its replacement)."""
+        if not runner_name.startswith(INSTANCE_NAME_PREFIX):
+            return False
+        own = re.compile(rf"^{INSTANCE_NAME_PREFIX}(dependabot-)?{re.escape(str(job_id))}(-r\d*)?$")
+        return not own.match(runner_name)
 
     def _handle_completed_job(self, workflow_job, delivery_id=None):
         """Handle completed workflow job.

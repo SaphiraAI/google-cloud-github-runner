@@ -144,12 +144,24 @@ variable "github_runners_provision_max_concurrent_dispatches" {
   }
 }
 variable "github_runners_provision_max_attempts" {
-  description = "Cloud Tasks attempts per provisioning task before it is left to the reconciler (30 s to 300 s backoff)"
+  description = "Cloud Tasks attempts per provisioning task before it is left to the reconciler (30 s backoff, doubling to github_runners_provision_max_backoff_seconds)"
   type        = number
   default     = 8
   validation {
     condition     = var.github_runners_provision_max_attempts >= 1 && var.github_runners_provision_max_attempts <= 100
     error_message = "Max attempts must be between 1 and 100."
+  }
+}
+# Longest wait between two attempts of one provisioning task. A capacity refusal is retried
+# after 30 seconds, doubling up to this; once VMs finish, a job waits up to this long for its retry.
+variable "github_runners_provision_max_backoff_seconds" {
+  description = "Longest backoff between retries of one runner provisioning task, in seconds"
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.github_runners_provision_max_backoff_seconds >= 30
+    error_message = "The maximum backoff must be at least the 30-second minimum backoff."
   }
 }
 # Cron schedule for the reconciler that creates VMs for stuck queued jobs and deletes idle runner VMs
