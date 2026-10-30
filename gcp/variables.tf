@@ -164,6 +164,17 @@ variable "github_runners_reconcile_stuck_minutes" {
   }
 }
 
+variable "github_runners_reconcile_queue_grace_minutes" {
+  description = "Minutes a queued job is left to its own webhook provisioning before the reconciler counts it against the label's free runners"
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.github_runners_reconcile_queue_grace_minutes >= 1
+    error_message = "The grace period must be at least 1 minute so a webhook-created VM is not doubled."
+  }
+}
+
 # After this many hours queued, a job is retried at a reduced rate (never dropped)
 variable "github_runners_reconcile_slow_retry_hours" {
   description = "Hours after which the reconciler retries a still-queued job only every slow-retry interval instead of every pass"

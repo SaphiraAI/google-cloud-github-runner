@@ -36,6 +36,7 @@ module "cloud_run_github_runners_manager" {
         RECONCILE_INVOKER_EMAIL        = module.service-account-github-runners-reconciler.email
         RECONCILE_AUDIENCE             = local.github_runners_manager_audience
         RECONCILE_STUCK_MINUTES        = tostring(var.github_runners_reconcile_stuck_minutes)
+        RECONCILE_QUEUE_GRACE_MINUTES  = tostring(var.github_runners_reconcile_queue_grace_minutes)
         RECONCILE_EXCLUDE_REPOSITORIES = join(",", var.github_runners_reconcile_exclude_repositories)
         RECONCILE_SLOW_RETRY_HOURS     = tostring(var.github_runners_reconcile_slow_retry_hours)
         RECONCILE_SLOW_RETRY_MINUTES   = tostring(var.github_runners_reconcile_slow_retry_minutes)

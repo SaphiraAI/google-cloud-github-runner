@@ -652,3 +652,131 @@ class TestHeartbeat:
         with pytest.raises(RuntimeError):
             service.run()
         assert 'reconcile_heartbeat' not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Label pool: GitHub gives a queued job to any runner with its label, so a VM created for one
+# job often runs another. Jobs are counted against a label's free VMs, not matched by job id.
+# ---------------------------------------------------------------------------
+
+def other_repo_running(job_id, runner_name):
+    return job(job_id, 'in_progress', runner_name=runner_name)
+
+
+class TestLabelPool:
+    def test_job_whose_own_vm_runs_another_job_gets_a_new_vm(self):
+        # Job 1's VM took job 2. Matching by job id saw job 1 as covered and left it waiting.
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=5),
+                                                          other_repo_running(2, 'gcp-runner-1')]},
+                            runners={('org', 'example-org'): [runner('gcp-runner-1', busy=True)]})
+        gcloud = FakeGCloud([vm('gcp-runner-1', age_minutes=5, job_id=1)])
+        report, provisioner = run_pass(github, gcloud)
+        assert [(c['job_id'], c['name_suffix']) for c in provisioner.calls] == [(1, RECONCILE_NAME_SUFFIX)]
+        assert gcloud.deleted == []
+
+    def test_idle_runner_of_the_label_covers_a_queued_job(self):
+        # A VM made for job 7 (now done elsewhere) is idle and registered: GitHub will give it job 1.
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=5)]},
+                            runners={('org', 'example-org'): [runner('gcp-runner-7')]})
+        gcloud = FakeGCloud([vm('gcp-runner-7', age_minutes=5, job_id=7)])
+        report, provisioner = run_pass(github, gcloud)
+        assert provisioner.calls == []
+
+    def test_booting_vm_of_the_label_covers_a_queued_job(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=6)]})
+        gcloud = FakeGCloud([vm('gcp-runner-8', age_minutes=1, job_id=8)])
+        report, provisioner = run_pass(github, gcloud)
+        assert provisioner.calls == []
+
+    def test_vm_reserved_for_a_job_in_its_grace_period_does_not_cover_an_older_job(self):
+        # Job 8 is 1 minute old: its own webhook task made gcp-runner-8, which is job 8's, not job 1's.
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=6),
+                                                          job(8, 'queued', age_minutes=1)]})
+        gcloud = FakeGCloud([vm('gcp-runner-8', age_minutes=1, job_id=8)])
+        report, provisioner = run_pass(github, gcloud)
+        assert [c['job_id'] for c in provisioner.calls] == [1]
+
+    def test_job_within_the_grace_period_is_left_to_its_webhook_task(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=2)]})
+        report, provisioner = run_pass(github, FakeGCloud([]))
+        assert provisioner.calls == []
+
+    def test_creates_only_the_deficit_and_prefers_jobs_without_a_vm(self):
+        # Three queued jobs, one free (booting) VM: two VMs, for the two jobs with no VM of their own.
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=9), job(2, 'queued', age_minutes=8),
+                                                          job(3, 'queued', age_minutes=7)]})
+        gcloud = FakeGCloud([vm('gcp-runner-3', age_minutes=2, job_id=3)])
+        report, provisioner = run_pass(github, gcloud)
+        assert sorted(c['job_id'] for c in provisioner.calls) == [1, 2]
+
+    def test_second_replacement_gets_a_new_name(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=20),
+                                                          other_repo_running(2, 'gcp-runner-1'),
+                                                          other_repo_running(3, 'gcp-runner-1-r')]},
+                            runners={('org', 'example-org'): [runner('gcp-runner-1', busy=True),
+                                                              runner('gcp-runner-1-r', busy=True)]})
+        gcloud = FakeGCloud([vm('gcp-runner-1', age_minutes=20, job_id=1), vm('gcp-runner-1-r', age_minutes=12, job_id=1)])
+        report, provisioner = run_pass(github, gcloud)
+        assert [(c['job_id'], c['name_suffix']) for c in provisioner.calls] == [(1, RECONCILE_NAME_SUFFIX + '2')]
+        assert gcloud.deleted == []
+
+    def test_idle_runner_is_kept_while_its_label_has_queued_jobs(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=20), job(4, 'completed')]},
+                            runners={('org', 'example-org'): [runner('gcp-runner-4')]})
+        gcloud = FakeGCloud([vm('gcp-runner-4', age_minutes=20, job_id=4)])
+        report, provisioner = run_pass(github, gcloud)
+        assert gcloud.deleted == []
+        assert 'a job is queued for its label' in reasons(report, 'kept')[0]
+        assert provisioner.calls == []
+
+    def test_idle_runner_whose_job_runs_elsewhere_is_retired_when_nothing_is_queued(self):
+        # Matching by job id kept this VM for as long as job 1 ran on another runner.
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [other_repo_running(1, 'gcp-runner-9')]},
+                            runners={('org', 'example-org'): [runner('gcp-runner-1', runner_id=11),
+                                                              runner('gcp-runner-9', busy=True)]})
+        gcloud = FakeGCloud([vm('gcp-runner-1', age_minutes=20, job_id=1), vm('gcp-runner-9', age_minutes=20, job_id=9)])
+        report, _ = run_pass(github, gcloud)
+        assert gcloud.deleted == [('gcp-runner-1', 'us-central1-b')]
+        assert github.deleted_runners == [(('org', 'example-org'), 11)]
+        assert report['deleted'][0]['reason'] == 'runner is registered and online, idle, and no job is queued for its label'
+
+    def test_only_surplus_idle_runners_are_retired_newest_kept(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=20)]},
+                            runners={('org', 'example-org'): [runner('gcp-runner-5'), runner('gcp-runner-6')]})
+        gcloud = FakeGCloud([vm('gcp-runner-6', age_minutes=12, job_id=6), vm('gcp-runner-5', age_minutes=30, job_id=5)])
+        report, provisioner = run_pass(github, gcloud)
+        assert gcloud.deleted == [('gcp-runner-5', 'us-central1-b')]
+        assert provisioner.calls == []
+
+    def test_no_runner_and_job_running_on_another_runner_is_retired(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [other_repo_running(1, 'gcp-runner-2')]},
+                            runners={('org', 'example-org'): [runner('gcp-runner-2', busy=True)]})
+        gcloud = FakeGCloud([vm('gcp-runner-1', age_minutes=20, job_id=1), vm('gcp-runner-2', age_minutes=20, job_id=2)])
+        report, _ = run_pass(github, gcloud)
+        assert gcloud.deleted == [('gcp-runner-1', 'us-central1-b')]
+        assert report['deleted'][0]['reason'] == 'no registered runner; its job is running on another runner'
+
+    def test_no_runner_but_its_job_just_started_on_it_is_kept(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued')]},
+                            fresh={'1': job(1, 'in_progress', runner_name='gcp-runner-1')})
+        gcloud = FakeGCloud([vm('gcp-runner-1', age_minutes=20, job_id=1)])
+        report, _ = run_pass(github, gcloud)
+        assert gcloud.deleted == []
+
+    def test_listing_failure_still_disables_deletes_but_not_creates(self):
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=20)]})
+        github.list_runners_error = {('org', 'example-org'): RuntimeError('502')}
+        gcloud = FakeGCloud([vm('gcp-runner-5', age_minutes=40, job_id=5)])
+        report, provisioner = run_pass(github, gcloud)
+        assert gcloud.deleted == []
+        assert any(entry.get('phase') == 'delete' for entry in report['skipped'])
+        # The stale VM counts as free supply, so nothing is created on an incomplete view.
+        assert provisioner.calls == []
+
+    def test_labels_are_counted_separately(self):
+        other = 'gcp-ubuntu-24-04-arm'
+        github = FakeGitHub(jobs={ORG_REPO['full_name']: [job(1, 'queued', age_minutes=6, labels=(other,))]},
+                            runners={('org', 'example-org'): [runner('gcp-runner-7')]})
+        gcloud = FakeGCloud([vm('gcp-runner-7', age_minutes=5, job_id=7)])  # idle, but for LABEL
+        report, provisioner = run_pass(github, gcloud)
+        assert [c['template'] for c in provisioner.calls] == [other]

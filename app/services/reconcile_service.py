@@ -6,10 +6,14 @@ that never registers leaves a VM with no job, and a job cancelled while queued l
 GitHub and Compute Engine waiting for an event that never comes. Run periodically (Cloud
 Scheduler -> POST /reconcile) this service:
 
-* creates a VM for every queued job on a ``gcp-`` label that has waited longer than
-  ``RECONCILE_STUCK_MINUTES`` with no VM for its job id (same path as the webhook);
-* deletes every runner VM older than ``RECONCILE_STUCK_MINUTES`` whose job is not running,
-  deregistering its runner from GitHub first so it cannot pick up a job mid-delete;
+* creates VMs per label for the queued jobs that the label's free runners cannot take. GitHub
+  hands a queued job to any runner with its label, so a VM created for one job often runs
+  another: jobs are counted against VMs by label, not matched by job id. A job queued less than
+  ``RECONCILE_QUEUE_GRACE_MINUTES`` is left to its own webhook task, and the VM made for it is
+  not counted as free for older jobs;
+* deletes every runner VM older than ``RECONCILE_STUCK_MINUTES`` that is not running a job:
+  one whose runner never registered or has gone, or an idle runner beyond the label's queued
+  demand, deregistering the runner from GitHub first so it cannot pick up a job mid-delete;
 * never deletes a VM that GitHub reports as running a job (by runner name or busy flag).
 
 Every decision is logged with the job id, VM name, zone and reason, and returned in the report.
@@ -29,6 +33,8 @@ from app.services.webhook_service import WebhookService
 logger = logging.getLogger(__name__)
 
 DEFAULT_STUCK_MINUTES = 10
+# A queued job younger than this is left to the VM its webhook task is creating.
+DEFAULT_QUEUE_GRACE_MINUTES = 3
 DEFAULT_MAX_CREATES = 20
 DEFAULT_CREATE_WORKERS = 4
 # Parallel GitHub listings per pass (well under GitHub's 100-concurrent secondary limit).
@@ -95,6 +101,7 @@ class ReconcileService:
         gcloud_client=None,
         webhook_service=None,
         stuck_minutes=None,
+        queue_grace_minutes=None,
         max_creates=None,
         create_workers=None,
         now=None,
@@ -108,6 +115,8 @@ class ReconcileService:
         )
         self.stuck_minutes = stuck_minutes if stuck_minutes is not None \
             else _env_int('RECONCILE_STUCK_MINUTES', DEFAULT_STUCK_MINUTES)
+        self.queue_grace_minutes = queue_grace_minutes if queue_grace_minutes is not None \
+            else _env_int('RECONCILE_QUEUE_GRACE_MINUTES', DEFAULT_QUEUE_GRACE_MINUTES)
         self.max_creates = max_creates if max_creates is not None \
             else _env_int('RECONCILE_MAX_CREATES', DEFAULT_MAX_CREATES)
         self.create_workers = create_workers if create_workers is not None \
@@ -119,6 +128,7 @@ class ReconcileService:
         self.slow_retry_minutes = max(1, _env_int('RECONCILE_SLOW_RETRY_MINUTES', DEFAULT_SLOW_RETRY_MINUTES))
         self.interval_minutes = max(1, _env_int('RECONCILE_INTERVAL_MINUTES', DEFAULT_INTERVAL_MINUTES))
         self._now = now
+        self._repo_names = {}  # sanitised owner/repo label key -> repository full name
         self.run_id = f"reconcile-{uuid.uuid4().hex[:8]}"
 
     # ------------------------------------------------------------------
@@ -259,6 +269,11 @@ class ReconcileService:
                 elif status == 'queued' and template_label_for(job.get('labels')):
                     queued_jobs.append((repo, job))
         report['queued_jobs'] = len(queued_jobs)
+        # Queued jobs per (sanitised) label: idle runners of a label are kept while it has demand.
+        queued_by_label = {}
+        for _, job in queued_jobs:
+            key = label_value(template_label_for(job.get('labels')))
+            queued_by_label[key] = queued_by_label.get(key, 0) + 1
         ages = [self.now() - parse_github_time(job.get('created_at')) for _, job in queued_jobs
                 if parse_github_time(job.get('created_at')) is not None]
         report['oldest_queued_job_age_seconds'] = int(max(ages).total_seconds()) if ages else 0
@@ -281,6 +296,7 @@ class ReconcileService:
             repo_name = (repo.get('full_name') or '/').split('/', 1)[1]
             # Keyed the way create_runner_instance writes the labels (sanitised GCE label values).
             scope_by_repo[self.repo_key(owner_login, repo_name)] = scope
+            self._repo_names[self.repo_key(owner_login, repo_name)] = repo.get('full_name')
             if scope[0] == 'org':
                 scope_by_owner[label_value(owner_login)] = scope
         runners_by_scope = {}
@@ -303,14 +319,22 @@ class ReconcileService:
             if failed_repo_keys:
                 logger.error("Reconcile %s: leaving VMs of %d repositor%s alone because their jobs could not be listed",
                              self.run_id, len(failed_repo_keys), 'y' if len(failed_repo_keys) == 1 else 'ies')
-            for vm in live_vms:
+            idle_budget = dict(queued_by_label)
+            # Newest first, so the idle VMs kept for queued jobs are the ones furthest from their
+            # maximum run duration; the oldest surplus is retired.
+            epoch = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+            for vm in sorted(live_vms, key=lambda v: v.get('created_at') or epoch, reverse=True):
                 self._reconcile_vm(
                     vm, token, running_runner_names, runners_by_scope, scope_by_owner, scope_by_repo,
-                    jobs_by_id, deleted_job_ids, report, dry_run, failed_repo_keys | excluded_keys,
+                    deleted_job_ids, idle_budget, report, dry_run, failed_repo_keys | excluded_keys,
                 )
 
         # --- Create phase ---------------------------------------------------------------
-        self._create_missing(queued_jobs, live_vms, deleted_job_ids, report, dry_run)
+        busy_names = set(running_runner_names)
+        for runners in runners_by_scope.values():
+            busy_names.update(name for name, r in runners.items() if r.get('busy'))
+        deleted_names = {entry['vm'] for entry in report['deleted']}
+        self._create_missing(queued_jobs, live_vms, deleted_job_ids, busy_names, deleted_names, report, dry_run)
 
         logger.info(
             "Reconcile %s finished: %d queued job(s), %d live VM(s), %d deleted, %d created, %d kept, "
@@ -341,11 +365,14 @@ class ReconcileService:
     # ------------------------------------------------------------------
 
     def _reconcile_vm(self, vm, token, running_runner_names, runners_by_scope, scope_by_owner, scope_by_repo,
-                      jobs_by_id, deleted_job_ids, report, dry_run, untouchable_repo_keys=frozenset()):
+                      deleted_job_ids, idle_budget, report, dry_run, untouchable_repo_keys=frozenset()):
+        """Keep or retire one VM by what its own runner is doing. The job id on its label says only
+        which job it was created for: GitHub may have given it any job with the label."""
         name = vm['name']
         zone = vm['zone']
         labels = vm.get('labels') or {}
         job_id = labels.get(JOB_ID_LABEL)
+        label = labels.get('gha-runner') or ''
         entry = {'vm': name, 'zone': zone, 'job_id': job_id}
 
         def keep(reason):
@@ -355,6 +382,13 @@ class ReconcileService:
         def skip(reason):
             logger.warning("Reconcile %s: skipping VM %s (zone %s, job %s): %s", self.run_id, name, zone, job_id, reason)
             report['skipped'].append({**entry, 'reason': reason})
+
+        def idle_decision(runner):
+            """An idle registered runner is kept while its label has queued jobs it can take."""
+            if idle_budget.get(label, 0) > 0:
+                idle_budget[label] -= 1
+                return 'runner is registered and online, idle, and a job is queued for its label', True
+            return 'runner is registered and online, idle, and no job is queued for its label', False
 
         if vm.get('created_at') is None:
             return skip('unknown creation time')
@@ -375,33 +409,6 @@ class ReconcileService:
         if runner and runner.get('busy'):
             return keep('GitHub reports the runner as busy')
 
-        if job_id:
-            repo_entry = jobs_by_id.get(job_id, (None, None))[0] or {}
-            repo_full_name = repo_entry.get('full_name') or f"{owner}/{repo_label}"
-            try:
-                job = self.github_client.get_workflow_job(repo_full_name, job_id, token=token)
-            except Exception as e:
-                return skip(f"could not re-check job {job_id}: {e}")
-            status = (job or {}).get('status')
-            if status == 'in_progress':
-                return keep('job re-checked as in_progress')
-            if status == 'queued':
-                if runner and runner.get('status') == 'online':
-                    return keep('job still queued and runner is registered and online')
-                reason = f"runner never registered after {self.stuck_minutes} minutes; job still queued"
-            elif job is None:
-                reason = 'job not found on GitHub'
-            else:
-                reason = f"job is {status}" + (f"/{job.get('conclusion')}" if job.get('conclusion') else '')
-        else:
-            status = None
-            if runner is None:
-                reason = 'no job label and no registered runner'
-            elif runner.get('status') == 'online':
-                reason = 'no job label and the runner is idle'
-            else:
-                reason = f"no job label and the runner is {runner.get('status')}"
-
         if runner is None:
             # The runner listing was taken at pass start; a runner that registered since could be
             # busy by now. Re-list the scope so the deregister step (and GitHub's refusal to remove a
@@ -411,12 +418,36 @@ class ReconcileService:
             except Exception as e:
                 return skip(f"could not re-list runners before deleting: {e}")
             runner = fresh.get(name)
-            if runner is not None:
-                if runner.get('busy'):
-                    return keep('runner registered since the listing and is busy')
-                if job_id and status == 'queued' and runner.get('status') == 'online':
-                    return keep('runner registered since the listing; job still queued')
-                reason += ' (runner registered during the pass; deregistering first)'
+            if runner is not None and runner.get('busy'):
+                return keep('runner registered since the listing and is busy')
+        if runner is None:
+            # Nothing to deregister, so GitHub's refusal to remove a busy runner cannot gate this
+            # delete. Re-check the VM's own job in case it started here after the listings.
+            if not job_id:
+                reason = 'no job label and no registered runner'
+            else:
+                repo_full_name = self._repo_names.get(f"{owner}/{repo_label}", f"{owner}/{repo_label}")
+                try:
+                    job = self.github_client.get_workflow_job(repo_full_name, job_id, token=token)
+                except Exception as e:
+                    return skip(f"could not re-check job {job_id}: {e}")
+                status = (job or {}).get('status')
+                if status == 'in_progress' and (job or {}).get('runner_name') == name:
+                    return keep('job re-checked as in_progress on this runner')
+                if job is None:
+                    reason = 'job not found on GitHub'
+                elif status == 'queued':
+                    reason = f"runner never registered after {self.stuck_minutes} minutes; job still queued"
+                elif status == 'in_progress':
+                    reason = 'no registered runner; its job is running on another runner'
+                else:
+                    reason = f"job is {status}" + (f"/{job.get('conclusion')}" if job.get('conclusion') else '')
+        elif runner.get('status') == 'online':
+            reason, kept = idle_decision(runner)
+            if kept:
+                return keep(reason)
+        else:
+            reason = f"runner is {runner.get('status')} and not busy"
 
         if self._retire_vm(vm, runner, scope, token, reason, report, dry_run) and job_id:
             deleted_job_ids.add(str(job_id))
@@ -456,59 +487,69 @@ class ReconcileService:
     # create phase
     # ------------------------------------------------------------------
 
-    def _create_missing(self, queued_jobs, live_vms, deleted_job_ids, report, dry_run):
-        covered = {str((vm.get('labels') or {}).get(JOB_ID_LABEL)) for vm in live_vms}
+    def _create_missing(self, queued_jobs, live_vms, deleted_job_ids, busy_names, deleted_names, report, dry_run):
+        """Create, per label, as many VMs as the label's queued jobs exceed its free VMs.
+
+        Demand: queued jobs older than the grace period. Supply: live VMs of the label not running
+        a job (booting, or registered and idle), not deleted this pass, and not created for a job
+        still inside the grace period (that VM is its own job's). VMs are named after the job they
+        are created for; a job whose own VM took another job gets ``-r``, ``-r2`` and so on.
+        """
+        live_names = {vm['name'] for vm in live_vms}
+        by_label = {}
+        for repo, job in queued_jobs:
+            by_label.setdefault(label_value(template_label_for(job.get('labels'))), []).append((repo, job))
+        grace = datetime.timedelta(minutes=self.queue_grace_minutes)
         candidates = []
         templates = None
         provisionable = {}  # label -> bool, resolved once per pass against the template list
-        for repo, job in queued_jobs:
-            job_id = str(job.get('id'))
-            created_at = parse_github_time(job.get('created_at'))
-            entry = {'job_id': job_id, 'repo': repo.get('full_name'), 'job': job.get('name')}
-            if job_id in deleted_job_ids:
-                logger.warning("Reconcile %s: job %s (%s): its VM was deleted in this pass; retrying next pass",
-                               self.run_id, job_id, repo.get('full_name'))
-                report['skipped'].append({**entry, 'reason': 'its VM was deleted in this pass; retry next pass'})
-                continue
-            if job_id in covered:
-                continue
-            if not self._is_stuck(created_at):
-                continue
-            if created_at is not None and self.now() - created_at >= datetime.timedelta(hours=self.slow_retry_hours):
-                # Never give up: keep trying, but once per slow interval instead of every pass, and say so loudly.
-                age_minutes = int((self.now() - created_at).total_seconds() // 60)
-                # Two pass intervals wide so a pass that runs a few seconds late cannot miss the
-                # window; a second consecutive attempt is prevented by the VM the first one created.
-                due = age_minutes % self.slow_retry_minutes < 2 * self.interval_minutes
-                logger.warning(
-                    "Reconcile %s: job %s (%s, %s) has been queued for %d h with no runner; %s",
-                    self.run_id, job_id, repo.get('full_name'), job.get('name'), age_minutes // 60,
-                    "retrying now" if due else
-                    f"retrying at most every {self.slow_retry_minutes} min (next in about "
-                    f"{self.slow_retry_minutes - age_minutes % self.slow_retry_minutes} min)",
-                )
-                emit_structured(STUCK_JOB_EVENT, f"stuck job {job_id} queued for {age_minutes} min",
-                                run_id=self.run_id, job_id=job_id, repo=repo.get('full_name'),
-                                queued_minutes=age_minutes, retry_now=due)
-                if not due:
-                    reason = (f"queued for more than {self.slow_retry_hours} hours; "
-                              f"retried at most every {self.slow_retry_minutes} min")
-                    report['skipped'].append({**entry, 'reason': reason})
+        for label_key, jobs in by_label.items():
+            reserved = {str(job.get('id')) for _, job in jobs
+                        if parse_github_time(job.get('created_at')) is not None
+                        and self.now() - parse_github_time(job.get('created_at')) < grace}
+            supply = [vm for vm in live_vms
+                      if (vm.get('labels') or {}).get('gha-runner') == label_key
+                      and vm['name'] not in busy_names and vm['name'] not in deleted_names
+                      and str((vm.get('labels') or {}).get(JOB_ID_LABEL)) not in reserved]
+            covered = {str((vm.get('labels') or {}).get(JOB_ID_LABEL)) for vm in live_vms
+                       if (vm.get('labels') or {}).get('gha-runner') == label_key}
+            waiting = []
+            for repo, job in jobs:
+                job_id = str(job.get('id'))
+                created_at = parse_github_time(job.get('created_at'))
+                entry = {'job_id': job_id, 'repo': repo.get('full_name'), 'job': job.get('name')}
+                if created_at is None or job_id in reserved:
                     continue
-            # Jobs without a template must not consume the per-pass creation budget.
-            label = template_label_for(job.get('labels'))
+                if job_id in deleted_job_ids:
+                    logger.warning("Reconcile %s: job %s (%s): its VM was deleted in this pass; retrying next pass",
+                                   self.run_id, job_id, repo.get('full_name'))
+                    report['skipped'].append({**entry, 'reason': 'its VM was deleted in this pass; retry next pass'})
+                    continue
+                if not self._slow_retry_due(repo, job, created_at, entry, report):
+                    continue
+                waiting.append((created_at, repo, job))
+            deficit = len(waiting) - len(supply)
+            if deficit <= 0:
+                continue
+            # Jobs with no VM of their own first, then the oldest.
+            waiting.sort(key=lambda item: (str(item[2].get('id')) in covered, item[0]))
+            label = template_label_for(waiting[0][2].get('labels'))
             if label not in provisionable:
                 if templates is None:
                     templates = self.gcloud_client.list_templates()
                 provisionable[label] = self.gcloud_client.has_template_for(label, templates=templates)
             if not provisionable[label]:
-                logger.warning("Reconcile %s: job %s (%s, %s) is queued on label %s but no instance template matches it",
-                               self.run_id, job_id, repo.get('full_name'), job.get('name'), label)
-                report['skipped'].append({**entry, 'reason': f"no matching instance template for label {label}"})
+                for _, repo, job in waiting:
+                    logger.warning("Reconcile %s: job %s (%s, %s) is queued on label %s but no instance template matches it",
+                                   self.run_id, job.get('id'), repo.get('full_name'), job.get('name'), label)
+                    report['skipped'].append({'job_id': str(job.get('id')), 'repo': repo.get('full_name'),
+                                              'job': job.get('name'),
+                                              'reason': f"no matching instance template for label {label}"})
                 continue
-            candidates.append((created_at, repo, job))
+            for created_at, repo, job in waiting[:deficit]:
+                candidates.append((created_at, repo, job, self._name_suffix(str(job.get('id')), live_names)))
         candidates = self._share_budget(candidates)
-        for _, repo, job in candidates[self.max_creates:]:
+        for _, repo, job, _ in candidates[self.max_creates:]:
             logger.warning("Reconcile %s: job %s (%s) deferred to the next pass (more than %d creations)",
                            self.run_id, job.get('id'), repo.get('full_name'), self.max_creates)
             report['skipped'].append({'job_id': str(job.get('id')), 'repo': repo.get('full_name'),
@@ -518,7 +559,7 @@ class ReconcileService:
             return
 
         if dry_run:
-            for created_at, repo, job in candidates:
+            for created_at, repo, job, _ in candidates:
                 logger.warning("Reconcile %s (dry run): would create a VM for job %s (%s, %s) queued since %s",
                                self.run_id, job.get('id'), repo.get('full_name'), job.get('name'), created_at)
                 report['created'].append({'job_id': str(job.get('id')), 'repo': repo.get('full_name'),
@@ -526,7 +567,7 @@ class ReconcileService:
             return
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, self.create_workers)) as pool:
-            futures = {pool.submit(self._provision, repo, job): (repo, job) for _, repo, job in candidates}
+            futures = {pool.submit(self._provision, repo, job, suffix): (repo, job) for _, repo, job, suffix in candidates}
             for future in concurrent.futures.as_completed(futures):
                 repo, job = futures[future]
                 entry = {'job_id': str(job.get('id')), 'repo': repo.get('full_name'), 'job': job.get('name')}
@@ -545,6 +586,40 @@ class ReconcileService:
                                job.get('created_at'))
                 report['created'].append({**entry, 'vm': instance_name})
 
+    def _slow_retry_due(self, repo, job, created_at, entry, report):
+        """A job queued longer than slow_retry_hours is retried once per slow interval, not every pass."""
+        if self.now() - created_at < datetime.timedelta(hours=self.slow_retry_hours):
+            return True
+        job_id = str(job.get('id'))
+        age_minutes = int((self.now() - created_at).total_seconds() // 60)
+        # Two pass intervals wide so a pass that runs a few seconds late cannot miss the window.
+        due = age_minutes % self.slow_retry_minutes < 2 * self.interval_minutes
+        logger.warning(
+            "Reconcile %s: job %s (%s, %s) has been queued for %d h with no runner; %s",
+            self.run_id, job_id, repo.get('full_name'), job.get('name'), age_minutes // 60,
+            "retrying now" if due else
+            f"retrying at most every {self.slow_retry_minutes} min (next in about "
+            f"{self.slow_retry_minutes - age_minutes % self.slow_retry_minutes} min)",
+        )
+        emit_structured(STUCK_JOB_EVENT, f"stuck job {job_id} queued for {age_minutes} min",
+                        run_id=self.run_id, job_id=job_id, repo=repo.get('full_name'),
+                        queued_minutes=age_minutes, retry_now=due)
+        if not due:
+            report['skipped'].append({**entry, 'reason': (f"queued for more than {self.slow_retry_hours} hours; "
+                                                          f"retried at most every {self.slow_retry_minutes} min")})
+        return due
+
+    @staticmethod
+    def _name_suffix(job_id, live_names):
+        """``-r``, or ``-r2``, ``-r3``... when a VM of that name is still alive."""
+        n = 1
+        while True:
+            suffix = RECONCILE_NAME_SUFFIX if n == 1 else f"{RECONCILE_NAME_SUFFIX}{n}"
+            names = (f"gcp-runner-{job_id}{suffix}", f"gcp-runner-dependabot-{job_id}{suffix}")
+            if not any(name in live_names for name in names):
+                return suffix
+            n += 1
+
     @staticmethod
     def _share_budget(candidates):
         """
@@ -553,8 +628,8 @@ class ReconcileService:
         whole per-pass budget while another repository's single job waits.
         """
         by_repo = {}
-        for created_at, repo, job in sorted(candidates, key=lambda item: item[0]):
-            by_repo.setdefault(repo.get('full_name'), []).append((created_at, repo, job))
+        for item in sorted(candidates, key=lambda item: item[0]):
+            by_repo.setdefault(item[1].get('full_name'), []).append(item)
         queues = list(by_repo.values())  # insertion order = by oldest job
         ordered = []
         while queues:
@@ -566,7 +641,7 @@ class ReconcileService:
             queues = remaining
         return ordered
 
-    def _provision(self, repo, job):
+    def _provision(self, repo, job, name_suffix=RECONCILE_NAME_SUFFIX):
         owner = repo.get('owner') or {}
         org_name = owner.get('login') if (owner.get('type') or '').lower() == 'organization' else None
         return self.webhook_service.provision_runner(
@@ -577,5 +652,5 @@ class ReconcileService:
             org_name,
             job_id=job.get('id'),
             delivery_id=self.run_id,
-            name_suffix=RECONCILE_NAME_SUFFIX,
+            name_suffix=name_suffix,
         )
