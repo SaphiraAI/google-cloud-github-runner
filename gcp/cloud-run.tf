@@ -24,7 +24,7 @@ module "cloud_run_github_runners_manager" {
       resources = {
         limits = {
           cpu    = "1000m"
-          memory = "512Mi"
+          memory = var.github_runners_manager_memory
         }
         startup_cpu_boost = false # We do not scale to zero.
       }

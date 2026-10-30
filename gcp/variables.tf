@@ -98,6 +98,20 @@ variable "github_runners_manager_min_instance_count" {
   }
 }
 
+# Memory limit of each Cloud Run instance of the GitHub Actions Runners manager application.
+# Every provisioning thread holds its own Compute Engine request while waiting on an insert,
+# so a burst of queued jobs raises memory well above the idle level.
+variable "github_runners_manager_memory" {
+  description = "GitHub Actions Runners manager app memory limit per Cloud Run instance (e.g. 512Mi, 1Gi)"
+  type        = string
+  default     = "512Mi"
+
+  validation {
+    condition     = can(regex("^[0-9]+(Mi|Gi)$", var.github_runners_manager_memory))
+    error_message = "Memory must be a whole number of Mi or Gi, for example 512Mi or 1Gi."
+  }
+}
+
 # Maximum number of Cloud Run instances for the GitHub Actions Runners manager application
 variable "github_runners_manager_max_instance_count" {
   description = "GitHub Actions Runners manager app maximum instance count (Max. number of Cloud Run instances)"
