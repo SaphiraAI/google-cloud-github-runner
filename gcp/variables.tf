@@ -86,15 +86,17 @@ variable "github_runners_internal_cidr" {
 # Unfortunately, the Cloud Run cold start time is slow and often exceeds 30 seconds.
 # GitHub expects a response to webhook requests in under 10 seconds!
 # https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks#respond-within-10-seconds
-# Therefore, we always have to have one instance running and cannot scale to 0.
+# One warm instance keeps webhooks answered in time. 0 lets the manager scale to
+# zero when idle: the first webhook after an idle period then times out and the
+# queued job is picked up by the reconciler instead.
 variable "github_runners_manager_min_instance_count" {
-  description = "GitHub Actions Runners manager app min. instance count (a minimum of one Cloud Run instance is required to avoid GitHub webhook timeout!)"
+  description = "GitHub Actions Runners manager app min. instance count (0 scales to zero; webhooks after an idle period then time out and the reconciler takes over)"
   type        = number
   default     = 1
 
   validation {
-    condition     = var.github_runners_manager_min_instance_count >= 1
-    error_message = "Minimum instance count must be larger than or equal 1 to avoid GitHub webhook timeout!"
+    condition     = var.github_runners_manager_min_instance_count >= 0
+    error_message = "Minimum instance count must be larger than or equal to 0."
   }
 }
 

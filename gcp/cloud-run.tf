@@ -26,7 +26,7 @@ module "cloud_run_github_runners_manager" {
           cpu    = "1000m"
           memory = var.github_runners_manager_memory
         }
-        startup_cpu_boost = false # We do not scale to zero.
+        startup_cpu_boost = true # Shortens cold starts when scaled to zero.
       }
       env = {
         GOOGLE_CLOUD_PROJECT = var.project_id
@@ -84,7 +84,7 @@ module "cloud_run_github_runners_manager" {
     # The first generation with faster cold starts is still too slow for our webhook.
     gen2_execution_environment = true
     scaling = {
-      min_instance_count = var.github_runners_manager_min_instance_count # Min. 1, we do not scale to zero.
+      min_instance_count = var.github_runners_manager_min_instance_count
       max_instance_count = var.github_runners_manager_max_instance_count
     }
   }
